@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<!-- Hand-made sample in the shape treasury.py parses (OData Atom feed:
+     <m:properties> blocks, <d:NEW_DATE m:type=...>, <d:BC_* m:type=...>value</d:BC_*>).
+     Not captured from the live feed (the session proxy blocks home.treasury.gov);
+     replace with the Phase 3 capture when available.
+     Rows are deliberately out of date order. Entry 2 has an empty BC_4MONTH and no BC_2MONTH.
+     BC_1_5MONTH and BC_30YEARDISPLAY are unmapped extras that must be ignored. -->
+<feed xml:base="https://home.treasury.gov/" xmlns="http://www.w3.org/2005/Atom" xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+  <title type="text">DailyTreasuryYieldCurveRateData</title>
+  <entry>
+    <id>https://home.treasury.gov/Entry(2)</id>
+    <content type="application/xml">
+      <m:properties>
+        <d:Id m:type="Edm.Int32">2</d:Id>
+        <d:NEW_DATE m:type="Edm.DateTime">2026-01-05T00:00:00</d:NEW_DATE>
+        <d:BC_1MONTH m:type="Edm.Double">3.71</d:BC_1MONTH>
+        <d:BC_1_5MONTH m:type="Edm.Double">3.70</d:BC_1_5MONTH>
+        <d:BC_3MONTH m:type="Edm.Double">3.62</d:BC_3MONTH>
+        <d:BC_4MONTH m:type="Edm.Double" m:null="true"></d:BC_4MONTH>
+        <d:BC_6MONTH m:type="Edm.Double">3.55</d:BC_6MONTH>
+        <d:BC_1YEAR m:type="Edm.Double">3.48</d:BC_1YEAR>
+        <d:BC_2YEAR m:type="Edm.Double">3.45</d:BC_2YEAR>
+        <d:BC_3YEAR m:type="Edm.Double">3.50</d:BC_3YEAR>
+        <d:BC_5YEAR m:type="Edm.Double">3.66</d:BC_5YEAR>
+        <d:BC_7YEAR m:type="Edm.Double">3.86</d:BC_7YEAR>
+        <d:BC_10YEAR m:type="Edm.Double">4.10</d:BC_10YEAR>
+        <d:BC_20YEAR m:type="Edm.Double">4.69</d:BC_20YEAR>
+        <d:BC_30YEAR m:type="Edm.Double">4.80</d:BC_30YEAR>
+        <d:BC_30YEARDISPLAY m:type="Edm.Double">4.80</d:BC_30YEARDISPLAY>
+      </m:properties>
+    </content>
+  </entry>
+  <entry>
+    <id>https://home.treasury.gov/Entry(1)</id>
+    <content type="application/xml">
+      <m:properties>
+        <d:Id m:type="Edm.Int32">1</d:Id>
+        <d:NEW_DATE m:type="Edm.DateTime">2026-01-02T00:00:00</d:NEW_DATE>
+        <d:BC_1MONTH m:type="Edm.Double">3.70</d:BC_1MONTH>
+        <d:BC_1_5MONTH m:type="Edm.Double">3.69</d:BC_1_5MONTH>
+        <d:BC_2MONTH m:type="Edm.Double">3.66</d:BC_2MONTH>
+        <d:BC_3MONTH m:type="Edm.Double">3.60</d:BC_3MONTH>
+        <d:BC_4MONTH m:type="Edm.Double">3.58</d:BC_4MONTH>
+        <d:BC_6MONTH m:type="Edm.Double">3.52</d:BC_6MONTH>
+        <d:BC_1YEAR m:type="Edm.Double">3.47</d:BC_1YEAR>
+        <d:BC_2YEAR m:type="Edm.Double">3.44</d:BC_2YEAR>
+        <d:BC_3YEAR m:type="Edm.Double">3.49</d:BC_3YEAR>
+        <d:BC_5YEAR m:type="Edm.Double">3.65</d:BC_5YEAR>
+        <d:BC_7YEAR m:type="Edm.Double">3.85</d:BC_7YEAR>
+        <d:BC_10YEAR m:type="Edm.Double">4.00</d:BC_10YEAR>
+        <d:BC_20YEAR m:type="Edm.Double">4.68</d:BC_20YEAR>
+        <d:BC_30YEAR m:type="Edm.Double">4.79</d:BC_30YEAR>
+        <d:BC_30YEARDISPLAY m:type="Edm.Double">4.79</d:BC_30YEARDISPLAY>
+      </m:properties>
+    </content>
+  </entry>
+  <entry>
+    <id>https://home.treasury.gov/Entry(3)</id>
+    <content type="application/xml">
+      <m:properties>
+        <d:Id m:type="Edm.Int32">3</d:Id>
+        <d:NEW_DATE m:type="Edm.DateTime">2026-02-02T00:00:00</d:NEW_DATE>
+        <d:BC_1MONTH m:type="Edm.Double">3.75</d:BC_1MONTH>
+        <d:BC_10YEAR m:type="Edm.Double">4.20</d:BC_10YEAR>
+      </m:properties>
+    </content>
+  </entry>
+</feed>

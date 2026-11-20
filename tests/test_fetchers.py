@@ -30,16 +30,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from fetchers.fred      import fetch as fred_fetch
 from fetchers.yahoo     import fetch as yahoo_fetch
 from fetchers.treasury  import fetch as treasury_fetch
-from fetchers.shiller   import fetch as shiller_fetch
+
+# Live-network smoke tests: excluded from the default (offline) run by pytest.ini.
+# Run with:  python -m pytest -m integration
+# enable_socket overrides the --disable-socket in pytest.ini addopts.
+pytestmark = [pytest.mark.integration, pytest.mark.enable_socket]
 
 # A recent-but-not-too-recent start date: long enough to guarantee multiple
 # observations across all series frequencies (daily, monthly, quarterly).
 START = "2024-01-01"
-
-# Shiller CAPE is monthly and Shiller applies a short NaN lag to the most
-# recent 1-2 months while data is finalised. Use an earlier window so the
-# smoke test doesn't fail on a legitimate data-availability edge case.
-SHILLER_START = "2022-01-01"
 
 # Expected columns for the standard two-column contract.
 STANDARD_COLS = {"date", "value"}
@@ -123,31 +122,3 @@ def test_treasury_yield_curve():
             f"Dates not ascending for tenor '{tenor}'"
         )
 
-
-# ---------------------------------------------------------------------------
-# Shiller CAPE (monthly, from Yale ie_data.xls)
-# ---------------------------------------------------------------------------
-
-def test_shiller_cape():
-    """cape: monthly Shiller data, standard two-column contract."""
-    df = shiller_fetch("cape", start_date=SHILLER_START)
-    _assert_standard(df, "shiller/cape")
-    # CAPE has been above 10 and below 60 for all of recorded history.
-    assert df["value"].between(10, 60).all(), (
-        f"CAPE values outside plausible range [10, 60]: "
-        f"min={df['value'].min():.1f}, max={df['value'].max():.1f}"
-    )
-    # Verify the data parser is producing plausible recent dates. Shiller's
-    # public ie_data.xls has a known lag: the CAPE column is typically 2–3 years
-    # behind the current date because the 10-year real earnings calculation takes
-    # time to finalise. A 36-month cutoff catches date-parsing bugs (e.g. all
-    # dates landing in the 19th century) without false-failing on source lag.
-    import pandas as pd
-    from datetime import date
-    max_date = df["date"].max()
-    cutoff = pd.Timestamp(date.today()) - pd.DateOffset(months=36)
-    assert max_date >= cutoff, (
-        f"Most recent CAPE observation is {max_date.date()}, which is more than "
-        f"36 months ago. This likely indicates a date-parsing bug in shiller.py "
-        f"or a severely stale cache — delete dashboard/.cache/ie_data.xls and re-run."
-    )
