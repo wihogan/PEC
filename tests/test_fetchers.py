@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from fetchers.fred      import fetch as fred_fetch
 from fetchers.yahoo     import fetch as yahoo_fetch
 from fetchers.treasury  import fetch as treasury_fetch
+from fetchers.multpl    import fetch as multpl_fetch
 
 # Live-network smoke tests: excluded from the default (offline) run by pytest.ini.
 # Run with:  python -m pytest -m integration
@@ -122,3 +123,17 @@ def test_treasury_yield_curve():
             f"Dates not ascending for tenor '{tenor}'"
         )
 
+
+
+# ---------------------------------------------------------------------------
+# multpl.com — S&P 500 P/E (monthly, scraped HTML)
+# ---------------------------------------------------------------------------
+
+def test_multpl_sp500_pe():
+    """sp500_pe: scraped monthly series, standard two-column contract, recent data."""
+    df = multpl_fetch("sp500_pe")
+    _assert_standard(df, "multpl/sp500_pe")
+    assert df["date"].dtype == "datetime64[ns]", "date column must be datetime64[ns]"
+    assert df["date"].iloc[-1] >= pd.Timestamp.now() - pd.Timedelta(days=120), (
+        "latest multpl observation should be within ~4 months"
+    )

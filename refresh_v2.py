@@ -67,6 +67,7 @@ import argparse
 import json
 import logging
 import math
+import os
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -311,6 +312,11 @@ def _fetch_valuation_inputs(
                 f"Add it to _load_fetchers() in refresh.py."
             )
             log.warning("[%s] %s", vi_id, live_error)
+        elif os.environ.get("PEC_EPS_OVERRIDE_ONLY") == "1":
+            log.info(
+                "[%s] PEC_EPS_OVERRIDE_ONLY=1 — skipping live fetch, using manual_override",
+                vi_id,
+            )
         else:
             try:
                 df             = fetcher_module.fetch(series_id)
