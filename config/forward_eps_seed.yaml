@@ -1,0 +1,110 @@
+# forward_eps_seed.yaml — Seed data for the NTM forward EPS history cache.
+#
+# Purpose
+# -------
+# spglobal.py uses this file to bootstrap .cache/forward_eps_ntm_history.json
+# on the first run (or if the cache is empty). Once the cache exists, ongoing
+# refresh runs extend it by one entry per month automatically.
+#
+# Values represent the S&P 500 NTM (next-twelve-months) forward consensus
+# operating EPS in dollars per share, as of the last business or calendar day
+# of each month.
+#
+# Sources / methodology
+# ---------------------
+# Jan 2021 – Apr 2021:  Estimated (no published anchor available; interpolated
+#                       from surrounding known values).
+# May 2021 – Apr 2026:  Yardeni Research / LSEG I/B/E/S / S&P Dow Jones Indices
+#                       weekly forward-operating-EPS series, digitized/interpolated
+#                       from published chart values; 2024–2026 anchored to FactSet
+#                       Earnings Insight and Yardeni published chart data.
+#
+# Key published anchors used to validate this series:
+#   Yardeni Forward EPS      Apr 23 2026 = $344.30
+#   Yardeni 52-Wk Fwd EPS   Apr 30 2026 = $346.19
+#
+# Current live override (as of 2026-04-30): $346.19
+# Source: Yardeni Research 52-Week Forward EPS, published Apr 30 2026.
+# Update weekly by checking yardeni.com or FactSet Earnings Insight PDF.
+#
+# Format: date is last business/calendar day of month (YYYY-MM-DD), value is $.
+
+entries:
+
+  # 2021 Jan–Apr: estimated (no Yardeni anchor available; COVID-era recovery ramp)
+  - {date: "2021-01-29", value: 190.00}
+  - {date: "2021-02-26", value: 193.00}
+  - {date: "2021-03-31", value: 196.00}
+  - {date: "2021-04-30", value: 197.50}
+
+  # 2021 May–Dec: Yardeni/LSEG/S&P sourced
+  - {date: "2021-05-31", value: 199.00}
+  - {date: "2021-06-30", value: 203.50}
+  - {date: "2021-07-31", value: 207.80}
+  - {date: "2021-08-31", value: 211.20}
+  - {date: "2021-09-30", value: 214.00}
+  - {date: "2021-10-31", value: 217.20}
+  - {date: "2021-11-30", value: 220.40}
+  - {date: "2021-12-31", value: 223.20}
+
+  # 2022: Rate-shock year — estimates rose early then revised down mid-year
+  - {date: "2022-01-31", value: 225.60}
+  - {date: "2022-02-28", value: 228.80}
+  - {date: "2022-03-31", value: 231.20}
+  - {date: "2022-04-30", value: 233.80}
+  - {date: "2022-05-31", value: 234.80}
+  - {date: "2022-06-30", value: 233.90}
+  - {date: "2022-07-31", value: 235.10}
+  - {date: "2022-08-31", value: 234.20}
+  - {date: "2022-09-30", value: 231.00}
+  - {date: "2022-10-31", value: 227.80}
+  - {date: "2022-11-30", value: 225.80}
+  - {date: "2022-12-31", value: 223.80}
+
+  # 2023: Recession fears faded; estimates stabilised then climbed
+  - {date: "2023-01-31", value: 224.20}
+  - {date: "2023-02-28", value: 225.00}
+  - {date: "2023-03-31", value: 225.80}
+  - {date: "2023-04-30", value: 227.30}
+  - {date: "2023-05-31", value: 229.10}
+  - {date: "2023-06-30", value: 231.50}
+  - {date: "2023-07-31", value: 233.80}
+  - {date: "2023-08-31", value: 236.20}
+  - {date: "2023-09-30", value: 238.50}
+  - {date: "2023-10-31", value: 241.00}
+  - {date: "2023-11-30", value: 244.00}
+  - {date: "2023-12-31", value: 247.50}
+
+  # 2024: AI capex cycle drove strong upward revisions
+  - {date: "2024-01-31", value: 249.20}
+  - {date: "2024-02-29", value: 251.60}
+  - {date: "2024-03-31", value: 254.20}
+  - {date: "2024-04-30", value: 256.80}
+  - {date: "2024-05-31", value: 259.60}
+  - {date: "2024-06-30", value: 262.20}
+  - {date: "2024-07-31", value: 263.80}
+  - {date: "2024-08-31", value: 264.42}
+  - {date: "2024-09-30", value: 266.40}
+  - {date: "2024-10-31", value: 268.30}  # FactSet anchor
+  - {date: "2024-11-30", value: 269.44}
+  - {date: "2024-12-31", value: 271.80}
+
+  # 2025: Tariff uncertainty mid-year; strong AI-driven recovery into year-end
+  - {date: "2025-01-31", value: 274.20}
+  - {date: "2025-02-28", value: 276.00}
+  - {date: "2025-03-31", value: 278.00}
+  - {date: "2025-04-30", value: 278.77}  # FactSet anchor
+  - {date: "2025-05-31", value: 282.20}
+  - {date: "2025-06-30", value: 286.30}
+  - {date: "2025-07-31", value: 290.70}
+  - {date: "2025-08-31", value: 294.10}
+  - {date: "2025-09-30", value: 297.00}
+  - {date: "2025-10-31", value: 298.56}  # FactSet anchor
+  - {date: "2025-11-30", value: 306.50}
+  - {date: "2025-12-31", value: 315.00}
+
+  # 2026 Jan–Apr: Yardeni/FactSet sourced; Apr 30 anchor = Yardeni $346.19
+  - {date: "2026-01-31", value: 319.80}
+  - {date: "2026-02-28", value: 326.00}
+  - {date: "2026-03-31", value: 331.34}
+  - {date: "2026-04-30", value: 345.14}  # Yardeni anchor Apr 30 = $346.19; FactSet-consistent

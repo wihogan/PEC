@@ -1,0 +1,506 @@
+# series.yaml — Master data inventory for the Preston Macro Dashboard.
+#
+# Top-level structure
+# -------------------
+# series:           All time-series fetched for charting and KPI tiles. The
+#                   orchestrator iterates this list and writes results to
+#                   data.json under the "series" key.
+#
+# valuation_inputs: Point-in-time inputs for derived calculations (e.g. the
+#                   Wien DDM panel). These are NOT charted directly. The
+#                   orchestrator processes this section after the main series
+#                   loop and writes results to a separate "valuation_inputs"
+#                   block in data.json so downstream code can locate them
+#                   cleanly. To override automation: populate both value and
+#                   effective_date under manual_override — the orchestrator
+#                   uses the override if the live fetch raises FetchError.
+#
+# Series schema
+# -------------
+# id                  Unique key used in data.json and throughout the pipeline.
+# source              Fetcher module: fred | yahoo | treasury | shiller
+# series_id           Identifier passed verbatim to the fetcher (FRED code, Yahoo ticker, etc.)
+# label               Human-readable display label for the dashboard.
+# category            Pipeline grouping — orchestrator iterates by category:
+#                       equity | rates | yield_curve | credit | macro | commodity | fx
+# start_date          Earliest observation to fetch (ISO 8601). All series default to
+#                     2010-01-01 for ~15 years of history. CPI/GDP start earlier to
+#                     provide enough history for YoY transforms before the display window.
+# refresh_frequency   Controls how often the orchestrator re-fetches this series:
+#                       market_daily — refresh whenever market is open (9:30–16:00 ET
+#                                      Mon–Fri); outside market hours, skip if prior
+#                                      business day's close is already in data.json.
+#                       daily_once   — fetch at most once per business day regardless
+#                                      of time; timestamp displayed on dashboard.
+#                       monthly      — skip if last_fetched is in the current calendar month.
+#                       quarterly    — skip if last_fetched is in the current calendar quarter.
+#                     Omit or set to market_daily to get the default behavior.
+#                     Override all frequency checks with: python refresh.py --force
+# kpi                 true → series appears in the 12 headline KPI tiles at the top of
+#                     the dashboard. Omit or set false for chart-only series.
+# yoy_pct             true → apply 12-month percent change after fetching (CPI).
+#                     Orchestrator translates this to transform='pct_change_12m' when
+#                     calling fred.fetch(). Only valid for monthly FRED series.
+# notes               Attribution requirements or data caveats.
+
+# =============================================================================
+# SERIES — time-series data for charts and KPI tiles
+# =============================================================================
+
+series:
+
+  # ---------------------------------------------------------------------------
+  # EQUITY
+  # ---------------------------------------------------------------------------
+
+  - id:                sp500
+    source:            yahoo
+    series_id:         "^GSPC"
+    label:             "S&P 500"
+    category:          equity
+    start_date:        "1999-01-01"  # Extended for v2 "Max" range selector (back to Jan 1999)
+    refresh_frequency: market_daily
+    kpi:               true
+
+  - id:                dow_jones
+    source:            yahoo
+    series_id:         "^DJI"
+    label:             "Dow Jones"
+    category:          equity
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+    kpi:               true
+
+  - id:                nasdaq
+    source:            yahoo
+    series_id:         "^IXIC"
+    label:             "NASDAQ Composite"
+    category:          equity
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+    kpi:               true
+
+  - id:                developed_ex_us
+    source:            yahoo
+    series_id:         "VEA"
+    label:             "Developed ex-US (VEA)"
+    category:          equity
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+
+  - id:                emerging_markets
+    source:            yahoo
+    series_id:         "VWO"
+    label:             "Emerging Markets (VWO)"
+    category:          equity
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+
+  # v2 layout additions — Section 1 index selector and strip
+  - id:                russell_2000
+    source:            yahoo
+    series_id:         "^RUT"
+    label:             "Russell 2000"
+    category:          equity
+    start_date:        "2019-01-01"
+    refresh_frequency: market_daily
+
+  - id:                developed_ex_us_efa
+    source:            yahoo
+    series_id:         "EFA"
+    label:             "Developed ex-US (EFA)"
+    category:          equity
+    start_date:        "2019-01-01"
+    refresh_frequency: market_daily
+    notes:             "MSCI EAFE proxy via iShares EFA ETF. Complements existing VEA entry."
+
+  - id:                emerging_markets_eem
+    source:            yahoo
+    series_id:         "EEM"
+    label:             "Emerging Markets (EEM)"
+    category:          equity
+    start_date:        "2019-01-01"
+    refresh_frequency: market_daily
+    notes:             "MSCI EM proxy via iShares EEM ETF. Complements existing VWO entry."
+
+  # Section 5 Valuation strip — S&P 500 valuation metrics via multpl.com.
+  # All four are monthly series sourced from Shiller's dataset (history to 1871).
+  # Percentage series stored as decimals; render layer multiplies by 100 for display.
+  # Cache: .cache/multpl_{series_id}.html, 24-hour TTL.
+
+  - id:                sp500_dividend_yield
+    source:            multpl
+    series_id:         sp500_div_yield
+    label:             "S&P 500 Dividend Yield"
+    category:          equity
+    start_date:        "2010-01-01"
+    refresh_frequency: monthly
+    kpi:               true
+    notes:             "TTM dividend yield as decimal (e.g. 0.0107 = 1.07%). Source: multpl.com/s-p-500-dividend-yield"
+
+  - id:                sp500_pe
+    source:            multpl
+    series_id:         sp500_pe
+    label:             "S&P 500 Trailing P/E"
+    category:          equity
+    start_date:        "1980-01-01"
+    refresh_frequency: monthly
+    notes:             "Trailing 12-month P/E ratio. Source: multpl.com/s-p-500-pe-ratio"
+
+  - id:                sp500_earnings_yield
+    source:            multpl
+    series_id:         sp500_earnings_yield
+    label:             "S&P 500 Earnings Yield"
+    category:          equity
+    start_date:        "2010-01-01"
+    refresh_frequency: monthly
+    notes:             "TTM earnings yield as decimal (e.g. 0.0317 = 3.17%). Source: multpl.com/s-p-500-earnings-yield"
+
+  - id:                sp500_earnings
+    source:            multpl
+    series_id:         sp500_earnings
+    label:             "S&P 500 TTM Earnings"
+    category:          equity
+    start_date:        "2010-01-01"
+    refresh_frequency: monthly
+    notes:             "Trailing 12-month EPS ($/share). Lags ~2 quarters. Source: multpl.com/s-p-500-earnings"
+
+  - id:                shiller_cape
+    source:            multpl
+    series_id:         shiller_pe
+    label:             "Shiller CAPE"
+    category:          equity
+    start_date:        "1980-01-01"
+    refresh_frequency: monthly
+    kpi:               true
+    notes:             "multpl.com/shiller-pe/table/by-month — sourced from Shiller dataset, current data. Yale ie_data.xls retired (stale after Sep 2023)."
+
+  # ---------------------------------------------------------------------------
+  # RATES
+  # Fed Funds, short end, and long end. TIPS series for real rate decomposition.
+  # ---------------------------------------------------------------------------
+
+  - id:                fed_funds
+    source:            fred
+    series_id:         "DFF"
+    label:             "Fed Funds Rate"
+    category:          rates
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+    kpi:               true
+
+  - id:                treasury_1mo
+    source:            fred
+    series_id:         "DGS1MO"
+    label:             "1-Month Treasury"
+    category:          rates
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+    kpi:               true
+
+  - id:                treasury_10yr
+    source:            fred
+    series_id:         "DGS10"
+    label:             "10-Year Treasury"
+    category:          rates
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+    kpi:               true
+
+  # v2 layout additions — Section 2 rate charts and real yield panel
+  - id:                treasury_2yr
+    source:            fred
+    series_id:         "DGS2"
+    label:             "2-Year Treasury"
+    category:          rates
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+    kpi:               true
+
+  # tips_2yr removed: FRED has no DFII2 series (Treasury stopped issuing 2yr TIPS in 2009).
+  # Section 2 real yields chart uses tips_5yr and tips_10yr as the short/long anchors instead.
+
+  - id:                tips_5yr
+    source:            fred
+    series_id:         "DFII5"
+    label:             "5-Year TIPS"
+    category:          rates
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+
+  - id:                tips_7yr
+    source:            fred
+    series_id:         "DFII7"
+    label:             "7-Year TIPS"
+    category:          rates
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+
+  - id:                tips_10yr
+    source:            fred
+    series_id:         "DFII10"
+    label:             "10-Year TIPS"
+    category:          rates
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+
+  - id:                tips_20yr
+    source:            fred
+    series_id:         "DFII20"
+    label:             "20-Year TIPS"
+    category:          rates
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+
+  - id:                tips_30yr
+    source:            fred
+    series_id:         "DFII30"
+    label:             "30-Year TIPS"
+    category:          rates
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+
+
+  # ---------------------------------------------------------------------------
+  # YIELD CURVE
+  # Full daily curve from Treasury Direct XML — all tenors in one call.
+  # The treasury fetcher returns long-form (date, tenor, value); the orchestrator
+  # writes this block to data.json as a nested object keyed by tenor.
+  # Fetched once per business day (daily_once) — the 2-3 min fetch cost does not
+  # justify re-running intraday. Timestamp is displayed on the dashboard.
+  # ---------------------------------------------------------------------------
+
+  - id:                yield_curve
+    source:            treasury
+    series_id:         "daily_treasury_yield_curve"
+    label:             "Treasury Yield Curve"
+    category:          yield_curve
+    start_date:        "2010-01-01"
+    refresh_frequency: daily_once
+    notes:             "Returns 13 tenors: 1mo 2mo 3mo 4mo 6mo 1yr 2yr 3yr 5yr 7yr 10yr 20yr 30yr"
+
+  # ---------------------------------------------------------------------------
+  # CREDIT
+  # ICE BofA indices via FRED. Attribution required for external distribution.
+  # Feeds Section 4 credit spread chart.
+  # ---------------------------------------------------------------------------
+
+  - id:                hy_yield
+    source:            fred
+    series_id:         "BAMLH0A0HYM2EY"
+    label:             "HY Effective Yield"
+    category:          credit
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+    kpi:               true
+    notes:             "ICE BofA US High Yield — attribution required for external use"
+
+  - id:                aaa_yield
+    source:            fred
+    series_id:         "BAMLC0A1CAAAEY"
+    label:             "AAA Effective Yield"
+    category:          credit
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+    notes:             "ICE BofA AAA — attribution required for external use"
+
+  # ---------------------------------------------------------------------------
+  # MACRO
+  # Mixed frequencies: CPI and CAPE monthly, GDP and delinquency quarterly.
+  # CPI is fetched raw and transformed to YoY % in the orchestrator.
+  # start_date set earlier than display window to provide transform headroom.
+  # Feeds Section 4 macro charts.
+  # ---------------------------------------------------------------------------
+
+  - id:                cpi_yoy
+    source:            fred
+    series_id:         "CPIAUCSL"
+    label:             "CPI (YoY %)"
+    category:          macro
+    start_date:        "2005-01-01"
+    refresh_frequency: monthly
+    kpi:               true
+    yoy_pct:           true
+    notes:             "Fetched from 2005 to ensure full history after 12-month transform"
+
+  - id:                gdp_growth
+    source:            fred
+    series_id:         "A191RL1Q225SBEA"
+    label:             "Real GDP Growth (QoQ Ann.)"
+    category:          macro
+    start_date:        "2005-01-01"
+    refresh_frequency: quarterly
+    kpi:               true
+
+  - id:                consumer_delinquency
+    source:            fred
+    series_id:         "DRCLACBS"
+    label:             "Consumer Loan Delinquency Rate"
+    category:          macro
+    start_date:        "2005-01-01"
+    refresh_frequency: quarterly
+
+  # Section 4 consumer stress panel — auto and credit card delinquency
+  - id:                auto_loan_delinquency
+    source:            fred
+    series_id:         "DRALACBS"
+    label:             "Auto Loan Delinquency Rate"
+    category:          macro
+    start_date:        "2005-01-01"
+    refresh_frequency: quarterly
+    notes:             "Quarterly. Federal Reserve consumer credit data."
+
+  - id:                credit_card_delinquency
+    source:            fred
+    series_id:         "DRCCLACBS"
+    label:             "Credit Card Delinquency Rate"
+    category:          macro
+    start_date:        "2005-01-01"
+    refresh_frequency: quarterly
+    notes:             "Quarterly. Federal Reserve consumer credit data."
+
+  # NBER recession indicator — binary monthly series (1=recession, 0=expansion).
+  # Render layer translates 0→1 transitions into shaded bands across all charts.
+  - id:                nber_recession
+    source:            fred
+    series_id:         "USREC"
+    label:             "NBER Recession Indicator"
+    category:          macro
+    start_date:        "2005-01-01"
+    refresh_frequency: monthly
+    notes:             "Binary: 1=recession, 0=expansion. Used for chart shading bands only."
+
+  # ---------------------------------------------------------------------------
+  # COMMODITY
+  # Yahoo Finance futures proxies for spot prices. GC=F, SI=F, PL=F are the
+  # most liquid front-month futures and serve as clean spot proxies.
+  # Feeds Section 3 commodities strip and chart.
+  # ---------------------------------------------------------------------------
+
+  - id:                wti_crude
+    source:            fred
+    series_id:         "DCOILWTICO"
+    label:             "WTI Crude Oil ($/bbl)"
+    category:          commodity
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+    kpi:               true
+
+  - id:                gold_spot
+    source:            yahoo
+    series_id:         "GC=F"
+    label:             "Gold ($/oz)"
+    category:          commodity
+    start_date:        "2019-01-01"
+    refresh_frequency: market_daily
+    kpi:               true
+    notes:             "COMEX gold futures — cleanest free proxy for spot gold"
+
+  - id:                silver_spot
+    source:            yahoo
+    series_id:         "SI=F"
+    label:             "Silver ($/oz)"
+    category:          commodity
+    start_date:        "2019-01-01"
+    refresh_frequency: market_daily
+    notes:             "COMEX silver futures"
+
+  - id:                platinum_spot
+    source:            yahoo
+    series_id:         "PL=F"
+    label:             "Platinum ($/oz)"
+    category:          commodity
+    start_date:        "2019-01-01"
+    refresh_frequency: market_daily
+    notes:             "NYMEX platinum futures"
+
+  # ---------------------------------------------------------------------------
+  # FX — major pairs via FRED
+  # All quoted as units of foreign currency per USD unless noted.
+  # Feeds Section 3 FX strip and chart.
+  # ---------------------------------------------------------------------------
+
+  - id:                eur_usd
+    source:            fred
+    series_id:         "DEXUSEU"
+    label:             "EUR/USD"
+    category:          fx
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+    kpi:               true
+
+  - id:                cad_usd
+    source:            fred
+    series_id:         "DEXCAUS"
+    label:             "CAD/USD"
+    category:          fx
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+    notes:             "CAD per USD"
+
+  - id:                jpy_usd
+    source:            fred
+    series_id:         "DEXJPUS"
+    label:             "JPY/USD"
+    category:          fx
+    start_date:        "2010-01-01"
+    refresh_frequency: market_daily
+    notes:             "JPY per USD"
+
+  # Crypto — Section 3 FX/Crypto strip and chart.
+  - id:                btc_usd
+    source:            yahoo
+    series_id:         "BTC-USD"
+    label:             "Bitcoin (USD)"
+    category:          fx
+    start_date:        "2019-01-01"
+    refresh_frequency: market_daily
+    notes:             "Bitcoin/USD via yfinance — includes weekends"
+
+  - id:                eth_usd
+    source:            yahoo
+    series_id:         "ETH-USD"
+    label:             "Ethereum (USD)"
+    category:          fx
+    start_date:        "2019-01-01"
+    refresh_frequency: market_daily
+    notes:             "Ethereum/USD via yfinance"
+
+  - id:                xrp_usd
+    source:            yahoo
+    series_id:         "XRP-USD"
+    label:             "XRP (USD)"
+    category:          fx
+    start_date:        "2019-01-01"
+    refresh_frequency: market_daily
+    notes:             "XRP/USD via yfinance"
+
+# =============================================================================
+# VALUATION INPUTS
+# Point-in-time inputs for derived calculations (Wien DDM panel).
+# These are NOT charted directly. Written to data.json under "valuation_inputs".
+# =============================================================================
+
+valuation_inputs:
+
+  forward_eps_ntm:
+    fetcher:    spglobal
+    series_id:  forward_eps_ntm
+    label:      "S&P 500 NTM Forward Operating EPS"
+    manual_override:
+      value:    354.84
+      effective_date: "2026-05-07"
+    notes: >
+      NTM (next-twelve-months) consensus forward operating EPS for the S&P 500.
+      Update manually each week after markets close Friday.
+      Use the 52-Week Forward EPS line — NOT the calendar-year or GAAP EPS figures.
+
+      Primary source:
+        Yardeni Research — 52-Wk Forward EPS chart
+        https://www.yardeni.com/charts/us-stock-market/stock-market-forward-metrics/sp-500-forward-revenues-earnings-margins
+
+      Cross-check:
+        FactSet Earnings Insight PDF — bottom-up EPS table (p. 32+)
+        https://www.factset.com/earningsinsight
+        NOTE: FactSet PDF reports CY GAAP EPS (~$268-331 range), which is 20-30% lower
+        than NTM operating EPS. Use for directional cross-check only, not as the value.

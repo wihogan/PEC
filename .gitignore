@@ -1,0 +1,13 @@
+.venv/
+.cache/
+backups/
+PEC.html
+PEC_dev.html
+data_v2.json
+_site/
+health.json
+.env
+*.env
+__pycache__/
+*.pyc
+.pytest_cache/
