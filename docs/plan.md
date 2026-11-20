@@ -164,3 +164,23 @@ Automating EPS scraping; F8; changing data sources without Hogan's approval (Yah
 - **Q4 — default applied (not answered):** scrub work email, employer name and shared-drive paths before the first public commit.
 - Q1–Q3 per handoff, defaults taken: github.io URL with old link redirected; 14:17 PST / 15:17 PDT plus a retry run; EPS left at 354.84 / 2026-05-07 and flagged.
 - Hogan clicks expected: create repo (or approve), add `FRED_API_KEY` secret (at Phase 1, for the spike), set Pages source to GitHub Actions, confirm Actions email notifications are on, UAT, stop laptop routine; plus any capability the Phase 1 probe shows the session lacks.
+
+---
+
+## Phase 1 — capability probe results (2026-11-20 15:19 PT)
+
+| Capability | Result | Evidence |
+|---|---|---|
+| Push to `main` | OK | commits 2f08509, 344a801 |
+| Push workflow files (`.github/workflows/*`) | OK | `probe.yml` pushed; push-triggered run 44835813565 succeeded |
+| Create / delete a branch | OK | `probe-branch` created and deleted |
+| Dispatch a workflow | OK | run 44835866114 (`workflow_dispatch`) succeeded |
+| Read run status and job logs | OK | via REST `actions/runs`, `actions/jobs/{id}/logs` |
+| Dispatch actor | `wihogan` | dispatch-triggered notifications go to `wihogan` |
+| Runner timezone with `TZ=America/Los_Angeles` | OK | `15:18:58 PST` |
+| Read/write repo secrets | **Blocked** (proxy 403) | Hogan click |
+| Read/set Pages settings | **Blocked** (proxy 403) | Hogan click |
+| `FRED_API_KEY` secret | **Missing** | probe log; Hogan click (needed for Phase 3 spike) |
+| Scheduled (`schedule`) trigger fires | Not yet verified | verified by the Phase 3 spike cron |
+
+Repo is public, default branch `main`. Canonical remote is `https://github.com/wihogan/PEC.git` (GitHub reports the lowercase URL as moved).
