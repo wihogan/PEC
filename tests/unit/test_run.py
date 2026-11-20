@@ -277,3 +277,110 @@ def test_run_renders_into_tmp_here(env):
     html = (refresh_v2.HERE / "PEC.html").read_text(encoding="utf-8")
     assert "__DASHBOARD_DATA__" not in html
     assert '"last_refreshed":"2026-11-20T14:17:00"' in html
+
+
+# ---------------------------------------------------------------------------
+# PEC_EPS_OVERRIDE_ONLY=1 (plan §2, F11, B5)
+# ---------------------------------------------------------------------------
+def _with_monthly_sp500(env):
+    """S&P stub with month-end closes Jan 2024..Nov 2026 so fwd_pe_history can join."""
+    orig = env.fetchers["yahoo"].fetch
+
+    def fetch(**kw):
+        if kw["series_id"] == "^GSPC":
+            env.calls.append(("yahoo", kw))
+            months = pd.date_range("2024-01-31", "2026-11-30", freq="ME")
+            vals = [6000.0] * (len(months) - 1) + [7096.8]
+            return pd.DataFrame({"date": months, "value": vals})
+        return orig(**kw)
+
+    env.fetchers["yahoo"] = SimpleNamespace(fetch=fetch)
+
+
+def test_override_only_never_calls_live_point_fetch(env, monkeypatch):
+    monkeypatch.setenv("PEC_EPS_OVERRIDE_ONLY", "1")
+    _with_monthly_sp500(env)
+    orig = env.fetchers["spglobal"].fetch
+
+    def live_would_win(series_id, **kw):
+        if not kw.get("history"):
+            env.calls.append(("spglobal", dict(kw, series_id=series_id)))
+            return _df(["2026-11-20"], [999.0])   # would replace the override if called
+        return orig(series_id, **kw)
+
+    env.fetchers["spglobal"] = SimpleNamespace(fetch=live_would_win)
+    refresh_v2.run()
+    out = _out()
+
+    sp_calls = [kw for src, kw in env.calls if src == "spglobal"]
+    assert sp_calls == [{"series_id": "forward_eps_ntm", "history": True}]   # history only
+    eps = out["valuation_inputs"]["forward_eps_ntm"]
+    assert eps["source"] == "override"
+    assert eps["value"] == 354.84 and eps["effective_date"] == "2026-05-07"
+    assert len(eps["history"]["dates"]) == 30
+    assert out["metadata"]["statuses"]["forward_eps_ntm"] == {"status": "ok"}
+
+    # fwd_pe_history still built from the EPS history (30 months, Jan 2024..Jun 2026)
+    fph = out["series"]["fwd_pe_history"]
+    assert len(fph["dates"]) == 30
+    assert fph["dates"][0] == "2024-01-31" and fph["dates"][-1] == "2026-06-30"
+    assert fph["values"] == [20.0] * 30                     # 6000 / 300
+    vi = out["valuation_inputs"]
+    assert vi["forward_pe_ntm"] == 20.0                     # 7096.8 / 354.84
+    assert vi["fwdpe_delta_string"] == "+0% vs 5yr avg (20.0×)"
+    assert vi["ddm_fair_value"] == 4968                     # 10y 4.00
+
+
+def test_override_only_without_override_is_unavailable(env, monkeypatch, tmp_path):
+    monkeypatch.setenv("PEC_EPS_OVERRIDE_ONLY", "1")
+    cfg = json.loads(json.dumps(CONFIG))
+    cfg["valuation_inputs"]["forward_eps_ntm"]["manual_override"] = {"value": None, "effective_date": None}
+    p = tmp_path / "series3.yaml"
+    p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    monkeypatch.setattr(refresh_v2, "CONFIG_PATH", p)
+    refresh_v2.run()
+    out = _out()
+    assert out["valuation_inputs"]["forward_eps_ntm"]["source"] == "unavailable"
+    assert out["metadata"]["statuses"]["forward_eps_ntm"] == {"status": "warning", "error": "no data source available"}
+    assert [kw for src, kw in env.calls if src == "spglobal"] == []
+
+
+@pytest.mark.parametrize("flag", ["0", "", "true", "yes", " 1"])
+def test_override_only_requires_exact_1(env, monkeypatch, flag):
+    monkeypatch.setenv("PEC_EPS_OVERRIDE_ONLY", flag)
+    orig = env.fetchers["spglobal"].fetch
+
+    def live(series_id, **kw):
+        if kw.get("history"):
+            return orig(series_id, **kw)
+        return _df(["2026-11-20"], [999.0])
+
+    env.fetchers["spglobal"] = SimpleNamespace(fetch=live)
+    refresh_v2.run()
+    assert _out()["valuation_inputs"]["forward_eps_ntm"]["source"] == "live"
+
+
+def test_fetch_valuation_inputs_direct_override_only(monkeypatch):
+    monkeypatch.setenv("PEC_EPS_OVERRIDE_ONLY", "1")
+    calls = []
+
+    def fetch(series_id, **kw):
+        calls.append(kw)
+        if kw.get("history"):
+            return pd.DataFrame({"date": pd.to_datetime(["2026-04-30"]), "value": [346.19]})
+        raise AssertionError("live point fetch must not be called")
+
+    statuses = {}
+    out = refresh_v2._fetch_valuation_inputs(
+        CONFIG["valuation_inputs"], {"spglobal": SimpleNamespace(fetch=fetch)}, statuses
+    )
+    assert out == {
+        "forward_eps_ntm": {
+            "value": 354.84,
+            "effective_date": "2026-05-07",
+            "source": "override",
+            "history": {"dates": ["2026-04-30"], "values": [346.19]},
+        }
+    }
+    assert calls == [{"history": True}]
+    assert statuses == {"forward_eps_ntm": {"status": "ok"}}

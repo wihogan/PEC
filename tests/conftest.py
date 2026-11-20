@@ -59,8 +59,10 @@ def isolate_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(multpl, "_CACHE_DIR", cache)
     monkeypatch.setattr(yahoo, "_CACHE_DIR", cache)
 
-    # Never let a unit test see a real key.
-    monkeypatch.delenv("FRED_API_KEY", raising=False)
+    # Never let a unit test see a real key; neutralise workflow-level env
+    # (refresh.yml sets PEC_EPS_OVERRIDE_ONLY=1 for the job that also runs pytest).
+    for var in ("FRED_API_KEY", "PEC_EPS_OVERRIDE_ONLY", "GITHUB_RUN_ID"):
+        monkeypatch.delenv(var, raising=False)
     return tmp_path
 
 

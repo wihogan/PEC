@@ -43,11 +43,12 @@ save() {
   [ -f "$FILE" ] || { echo "state.sh: ${FILE} missing" >&2; exit 1; }
   tmp="$(mktemp -d)"
   wt="${tmp}/wt"
-  trap 'git worktree remove --force "$wt" >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
+  tmpbranch="${ref}-save-$$-${RANDOM}"
+  trap 'git worktree remove --force "$wt" >/dev/null 2>&1 || true; git branch -D "$tmpbranch" >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
   git worktree add --detach "$wt" HEAD >/dev/null
   (
     cd "$wt"
-    git checkout --orphan "${ref}-new" >/dev/null 2>&1
+    git checkout --orphan "$tmpbranch" >/dev/null 2>&1
     git rm -rf . >/dev/null 2>&1 || true
     find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
     cp "${root}/${FILE}" "$FILE"
