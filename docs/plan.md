@@ -173,7 +173,8 @@ Automating EPS scraping; F8; changing data sources without Hogan's approval (Yah
 |---|---|---|
 | Push to `main` | OK | commits 2f08509, 344a801 |
 | Push workflow files (`.github/workflows/*`) | OK | `probe.yml` pushed; push-triggered run 44835813565 succeeded |
-| Create / delete a branch | OK | `probe-branch` created and deleted |
+| Create a branch | OK | `probe-branch` created |
+| Delete a branch from the session | **Blocked** (proxy) | done from inside workflows instead (spike cleanup step) |
 | Dispatch a workflow | OK | run 44835866114 (`workflow_dispatch`) succeeded |
 | Read run status and job logs | OK | via REST `actions/runs`, `actions/jobs/{id}/logs` |
 | Dispatch actor | `wihogan` | dispatch-triggered notifications go to `wihogan` |
