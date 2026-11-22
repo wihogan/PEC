@@ -185,3 +185,21 @@ Automating EPS scraping; F8; changing data sources without Hogan's approval (Yah
 | Scheduled (`schedule`) trigger fires | Not yet verified | verified by the Phase 3 spike cron |
 
 Repo is public, default branch `main`. Canonical remote is `https://github.com/wihogan/PEC.git` (GitHub reports the lowercase URL as moved).
+
+---
+
+## Amendment A (2026-11-21) — triggers and alerts
+
+Approved by the owner; supersedes the GitHub-issue alert in sections 1, 6.2-6/8 and 8. All other sections stand.
+
+- **Primary trigger:** launchd job on the owner's always-on Mac (Pacific time) runs `gh workflow run refresh.yml -R wihogan/PEC --ref main` Mon–Fri at 13:20 and 15:50 PT (`mac/`).
+- **Secondary trigger:** the GitHub `schedule` crons in section 4 (`17 22` and `47 23`, UTC, Mon–Fri) stay as backup. Committed commented out with `# ENABLE AFTER PHASE 3 GO`. Overlapping runs are harmless: the second run skips series already current.
+- **Alerts go to Telegram, not GitHub issues.** The `notify` job in `refresh.yml` (failure or cancelled) sends the message via `tools/notify_telegram.sh`; the `issues: write` permission and the pinned issue are dropped. A Mac watchdog (`mac/pec-watchdog.sh`, 16:30 PT weekdays) alerts if no successful `refresh.yml` run on `main` exists today, and the Mac trigger alerts if `gh workflow run` itself fails. Production runs are titled `refresh [state]` via `run-name`; the watchdog counts only those, so `state-test` runs are ignored.
+- **New repo secrets:** `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (same values stored in the Mac Keychain as `pec-telegram-token`, `pec-telegram-chat`).
+- **Workflow additions:** `alert-test.yml` (manual one-message test); job `refresh` permissions are `contents: write` only; `state_ref` is a choice (`state`, `state-test`); extra guard: `deploy=true` is refused together with any inject on `state-test`; `eps_value` and `eps_date` must be given together and are format-validated before use.
+
+Adjusted test items:
+- **6.2-7 / 6.2-8 (replaces issue checks):** 6.2-6(a) and 6.2-7 pass when a `[TEST] ⚠️ PEC refresh FAILED` (6.2-6a) or `⚠️ PEC refresh FAILED` (6.2-7) Telegram message is received with the run URL and healthcheck failure lines, instead of an issue being opened.
+- **6.2-8 (scheduled-failure notification):** the notification test is "Telegram message received" for a failure of a scheduled or Mac-triggered run (flag file `.github/fail-next-scheduled` as before, or a Mac-triggered run with `inject=bad_fred_key`), plus: the Mac trigger failure alert (run `mac/pec-trigger.sh` with a bad `GH` path) and a watchdog alert (run it before any refresh that day) are each received. `alert-test.yml` and `mac/install.sh --test` pass.
+- **6.2-9:** additionally confirm Mac launchd runs appear in the run history (`workflow_dispatch` events at ~13:20 and ~15:50 PT) and `~/Library/Logs/pec/trigger.log` shows them.
+- **UAT:** "failure notification received" now means a Telegram message.

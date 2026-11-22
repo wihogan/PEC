@@ -1,0 +1,58 @@
+# PEC Runbook (for the owner)
+
+Dashboard: https://wihogan.github.io/PEC/ (confirm the capitalisation of this URL after the first deploy)
+Repo: https://github.com/wihogan/PEC
+
+## 1. How the daily refresh works
+
+| What | When (Pacific, Mon-Fri) | Notes |
+|---|---|---|
+| Mac trigger (primary) | 1:20 PM and 3:50 PM | Mac runs `gh workflow run`; the Mac must be awake and online |
+| GitHub schedule (backup) | about 2:17 PM and 3:47 PM (3:17 / 4:47 PM in summer time) | Only active after Phase 3 go; if a run is already up to date it does little |
+| Watchdog (Mac) | 4:30 PM | Alerts if no successful refresh happened today |
+
+Each run: fetch data, build the page, run the healthcheck, then publish to the page. If anything fails the old page stays up and you get a Telegram message. The data's memory (state) is saved only after a good run.
+
+## 2. Telegram alerts
+
+| Message | Meaning | What to do |
+|---|---|---|
+| `⚠️ PEC refresh FAILED` (with run link and failure lines) | The refresh ran and failed or was cancelled. Old page is still live. | Open the link to read why. Most failures are a data source down for a day: re-run later (section 3). If it repeats for 2+ days, ask for help. |
+| `[TEST] ⚠️ PEC refresh FAILED` | A test run on the test state failed | Normal during testing; ignore otherwise |
+| `⚠️ PEC: Mac could not trigger refresh (gh exit N)` | The Mac could not start the run (login expired, offline) | Run `gh auth status` on the Mac; `gh auth login` if needed. Meanwhile do a manual refresh. The GitHub backup schedule may still run. |
+| `⚠️ PEC: no successful refresh today as of HH:MM PT` | Watchdog found no successful run today | Trigger a manual refresh (section 3), then check the Mac jobs |
+| `⏳ PEC: refresh still in progress` | A run is going but not finished at 4:30 PM | Wait a few minutes; you will be alerted again only if it fails |
+| `⚠️ PEC: watchdog could not query GitHub` | Mac/GitHub login problem | Check `gh auth status` on the Mac |
+
+No message does not guarantee success if the Mac was off. If the page timestamp looks old, refresh manually.
+
+## 3. Manual refresh
+
+Phone: GitHub app, wihogan/PEC, Actions, refresh, Run workflow (leave defaults), Run.
+Web: https://github.com/wihogan/PEC/actions/workflows/refresh.yml, Run workflow, Run.
+
+Options: `force` re-fetches every series (use after a bad day). Leave `deploy` on, `state_ref` = `state`, `inject` = `none`. The other values are for testing only.
+
+## 4. Update forward EPS
+
+Same Run workflow screen. Fill `eps_value` (a number from 200 to 600) and `eps_date` (YYYY-MM-DD, not in the future). Both are required together. The run edits `config/series_v2.yaml` on main, then refreshes. Bad values make the run fail at the start with a clear message and change nothing. Check the DDM panel on the page afterwards.
+
+## 5. Reading health.json
+
+Open https://wihogan.github.io/PEC/health.json . Key fields: `ok` (true/false), `last_refreshed`, `run_id`, `failures` (should be empty), `warnings` (slow series that are old; informational), `series` (last observation date and age of each). Warnings never block publishing; failures do.
+
+## 6. Where state lives
+
+Branch `state` on the repo holds one file, `data_v2.json`, replaced after each good run. Branch `state-test` is for testing. Run logs and health.json are also attached to each run for 7 days (run page, Artifacts). The page itself is never stored in git. The only secrets are `FRED_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (GitHub repo secrets) and the two Keychain items on the Mac.
+
+## 7. Mac jobs: install and uninstall
+
+Install: `bash mac/install.sh` (preview with `--dry-run`; `--reset-secrets` to change Telegram values; `--test` sends a test message). Needs `gh` installed and logged in with access to wihogan/PEC. Uninstall: `bash mac/uninstall.sh` (`--purge-secrets` also deletes Keychain items). Logs: `~/Library/Logs/pec/`. See `mac/README.md`.
+To check the Telegram path from GitHub: Actions, alert-test, Run workflow.
+
+## 8. Rollback
+
+- Bad data published: the last good data is in `state`; re-run refresh with `force` after the source recovers. An earlier page cannot be re-deployed directly; instead revert the code commit on main (GitHub, Commits, Revert) and re-run refresh.
+- Bad EPS: run the EPS update again with the correct value.
+- Stop everything: `bash mac/uninstall.sh` and disable the workflow (Actions, refresh, three dots, Disable workflow). The old laptop process remains as documented in the migration handoff.
+- Broken `state`: delete the `state` branch on GitHub; the next run reseeds it from the saved baseline (it logs a loud warning).

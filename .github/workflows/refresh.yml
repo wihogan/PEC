@@ -1,0 +1,337 @@
+# PEC daily refresh (plan.md section 1, Amendment A).
+# Primary trigger: launchd job on the owner's Mac running `gh workflow run`.
+# Secondary trigger: the GitHub `schedule` below (enabled after Phase 3 go).
+# Failure alerts go to Telegram (notify job). All user inputs reach scripts via env: only.
+name: refresh
+run-name: "refresh [${{ inputs.state_ref || 'state' }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force re-fetch of every series'
+        type: boolean
+        default: false
+      deploy:
+        description: 'Deploy to GitHub Pages'
+        type: boolean
+        default: true
+      state_ref:
+        description: 'State branch (state = production, state-test = integration tests)'
+        type: choice
+        options: [state, state-test]
+        default: state
+      inject:
+        description: 'Failure injection (testing only)'
+        type: choice
+        options: [none, bad_fred_key, bogus_series, stale_state]
+        default: none
+      eps_value:
+        description: 'New forward EPS (200-600), blank = leave unchanged'
+        type: string
+        default: ''
+      eps_date:
+        description: 'EPS effective date YYYY-MM-DD (required with eps_value)'
+        type: string
+        default: ''
+  # ENABLE AFTER PHASE 3 GO
+  # schedule:
+  #   - cron: '17 22 * * 1-5'
+  #   - cron: '47 23 * * 1-5'
+
+env:
+  TZ: America/Los_Angeles
+  PEC_EPS_OVERRIDE_ONLY: '1'
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: pec-state-${{ inputs.state_ref == 'state-test' && 'state-test' || 'state' }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    outputs:
+      deploy: ${{ steps.norm.outputs.deploy }}
+      state_ref: ${{ steps.norm.outputs.state_ref }}
+      inject: ${{ steps.norm.outputs.inject }}
+    steps:
+      - name: Normalise inputs
+        id: norm
+        env:
+          EVENT: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          IN_FORCE: ${{ inputs.force }}
+          IN_DEPLOY: ${{ inputs.deploy }}
+          IN_STATE_REF: ${{ inputs.state_ref }}
+          IN_INJECT: ${{ inputs.inject }}
+          IN_EPS_VALUE: ${{ inputs.eps_value }}
+          IN_EPS_DATE: ${{ inputs.eps_date }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "schedule" ]; then
+            force=false; deploy=true; state_ref=state; inject=none; eps_value=''; eps_date=''
+          else
+            force="${IN_FORCE:-false}"
+            deploy="${IN_DEPLOY:-true}"
+            state_ref="${IN_STATE_REF:-state}"
+            inject="${IN_INJECT:-none}"
+            eps_value="${IN_EPS_VALUE:-}"
+            eps_date="${IN_EPS_DATE:-}"
+          fi
+          die() { echo "::error::$1"; exit 1; }
+          case "$force" in true|false) ;; *) die "bad force value" ;; esac
+          case "$deploy" in true|false) ;; *) die "bad deploy value" ;; esac
+          case "$state_ref" in state|state-test) ;; *) die "bad state_ref" ;; esac
+          case "$inject" in none|bad_fred_key|bogus_series|stale_state) ;; *) die "bad inject" ;; esac
+          # Validate EPS strings before they are written anywhere (blocks newline/output injection).
+          if [ -n "$eps_value" ] && ! printf '%s' "$eps_value" | grep -Eq '^[0-9]+(\.[0-9]+)?$'; then
+            die "eps_value must be a plain number"
+          fi
+          if [ -n "$eps_date" ] && ! printf '%s' "$eps_date" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'; then
+            die "eps_date must be YYYY-MM-DD"
+          fi
+          if [ -n "$eps_value" ] && [ -z "$eps_date" ]; then die "eps_value requires eps_date"; fi
+          if [ -z "$eps_value" ] && [ -n "$eps_date" ]; then die "eps_date requires eps_value"; fi
+          # Guards (plan section 1)
+          if [ "$state_ref" = "state" ]; then
+            if [ "$inject" != "none" ] && [ "$inject" != "bad_fred_key" ]; then
+              die "on state_ref=state the only allowed inject is bad_fred_key"
+            fi
+            if [ "$inject" = "bad_fred_key" ] && [ -n "$eps_value" ]; then
+              die "bad_fred_key must not be combined with eps_value"
+            fi
+            if [ -n "$eps_value" ] && [ "$GIT_REF" != "refs/heads/main" ]; then
+              die "eps_value on state_ref=state must run from main"
+            fi
+          else
+            # Never publish test/injected data to the live page.
+            if [ "$deploy" = "true" ] && [ "$inject" != "none" ]; then
+              die "deploy=true is not allowed together with an inject on state-test"
+            fi
+          fi
+          {
+            echo "force=$force"
+            echo "deploy=$deploy"
+            echo "state_ref=$state_ref"
+            echo "inject=$inject"
+            echo "eps_value=$eps_value"
+            echo "eps_date=$eps_date"
+          } >> "$GITHUB_OUTPUT"
+          echo "normalised: force=$force deploy=$deploy state_ref=$state_ref inject=$inject eps_value=${eps_value:-<none>}"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Unit tests
+        run: python -m pytest -q
+
+      - name: Update forward EPS
+        if: steps.norm.outputs.eps_value != ''
+        env:
+          EPS_VALUE: ${{ steps.norm.outputs.eps_value }}
+          EPS_DATE: ${{ steps.norm.outputs.eps_date }}
+          STATE_REF: ${{ steps.norm.outputs.state_ref }}
+        run: |
+          set -euo pipefail
+          python tools/set_eps.py --value "$EPS_VALUE" --date "$EPS_DATE"
+          if [ "$STATE_REF" != "state" ]; then
+            echo "state_ref=$STATE_REF: EPS edit applied to the working copy only (not committed)"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898579+github-actions[bot]@users.noreply.github.com"
+          git add config/series_v2.yaml
+          if git diff --cached --quiet; then
+            echo "EPS config unchanged; nothing to commit"
+            exit 0
+          fi
+          git commit -q -m "EPS override: ${EPS_VALUE} effective ${EPS_DATE}"
+          if ! git push origin HEAD:main; then
+            echo "push rejected; rebasing once"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
+
+      - name: Restore state
+        env:
+          STATE_REF: ${{ steps.norm.outputs.state_ref }}
+        run: tools/state.sh restore "$STATE_REF"
+
+      - name: Failure injection
+        if: steps.norm.outputs.inject != 'none'
+        env:
+          INJECT: ${{ steps.norm.outputs.inject }}
+        run: |
+          set -euo pipefail
+          bogus() {
+            sed -i '/id: *dow_jones/,/series_id/ s/series_id:.*/series_id:         "^BOGUS"/' config/series_v2.yaml
+            grep -q '"^BOGUS"' config/series_v2.yaml || { echo "::error::bogus_series edit did not apply"; exit 1; }
+          }
+          case "$INJECT" in
+            bad_fred_key)
+              echo "bad_fred_key: FRED_API_KEY will be 'invalid' in the refresh step"
+              ;;
+            bogus_series)
+              bogus
+              ;;
+            stale_state)
+              python - <<'PY'
+          import json
+          from datetime import date, timedelta
+          p = "data_v2.json"
+          d = json.load(open(p))
+          s = d["series"]["dow_jones"]
+          s["dates"] = [(date.fromisoformat(x) - timedelta(days=30)).isoformat() for x in s["dates"]]
+          json.dump(d, open(p, "w"))
+          print("stale_state: shifted dow_jones dates back 30 days")
+          PY
+              bogus
+              ;;
+          esac
+
+      - name: Refresh
+        env:
+          FRED_API_KEY: ${{ steps.norm.outputs.inject == 'bad_fred_key' && 'invalid' || secrets.FRED_API_KEY }}
+          FORCE: ${{ steps.norm.outputs.force }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$FORCE" = "true" ]; then args+=(--force); fi
+          python refresh_v2.py "${args[@]}" 2>&1 | tee refresh.log
+
+      - name: Healthcheck
+        run: |
+          set -euo pipefail
+          python healthcheck.py --out health.json 2>&1 | tee -a refresh.log
+
+      - name: Secret leak scan
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: tools/leak_scan.sh PEC.html data_v2.json health.json
+
+      - name: Save state
+        env:
+          STATE_REF: ${{ steps.norm.outputs.state_ref }}
+        run: tools/state.sh save "$STATE_REF"
+
+      - name: Keep-alive
+        if: github.event_name == 'schedule' || (steps.norm.outputs.state_ref == 'state' && steps.norm.outputs.inject == 'none')
+        env:
+          GIT_REF: ${{ github.ref }}
+        run: |
+          set -uo pipefail
+          if [ "$GIT_REF" != "refs/heads/main" ]; then echo "not on main; skipping"; exit 0; fi
+          git fetch --depth=1 origin main || { echo "::warning::keep-alive fetch failed"; exit 0; }
+          last="$(git log -1 --format=%ct FETCH_HEAD)"
+          age_days=$(( ( $(date +%s) - last ) / 86400 ))
+          echo "last commit on main is ${age_days} day(s) old"
+          if [ "$age_days" -gt 30 ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898579+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -q -m "keep-alive"
+            git push origin HEAD:main || echo "::warning::keep-alive push failed"
+          fi
+
+      - name: Build site
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          cp PEC.html _site/index.html
+          cp health.json _site/health.json
+
+      - name: Upload Pages artifact
+        if: steps.norm.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Upload health and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pec-health-${{ github.run_id }}
+          path: |
+            health.json
+            refresh.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  deploy:
+    needs: refresh
+    if: needs.refresh.outputs.deploy == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  notify:
+    needs: [refresh, deploy]
+    if: >-
+      always() && (
+        needs.refresh.result == 'failure' || needs.deploy.result == 'failure' ||
+        needs.refresh.result == 'cancelled' || needs.deploy.result == 'cancelled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download health artifact
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: pec-health-${{ github.run_id }}
+          path: health_dl
+
+      - name: Compose and send Telegram alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EVENT: ${{ github.event_name }}
+          STATE_REF: ${{ needs.refresh.outputs.state_ref || inputs.state_ref || 'state' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          python3 - <<'PY'
+          import json, os
+          prefix = "[TEST] " if os.environ["STATE_REF"] == "state-test" else ""
+          lines = [
+              prefix + "⚠️ PEC refresh FAILED",
+              "event: " + os.environ["EVENT"],
+              "state_ref: " + os.environ["STATE_REF"],
+              "run: " + os.environ["RUN_URL"],
+              "",
+          ]
+          try:
+              h = json.load(open("health_dl/health.json"))
+              fails = h.get("failures") or []
+              if fails:
+                  lines.append("Healthcheck failures (%d):" % len(fails))
+                  lines += ["- " + str(f)[:200] for f in fails[:10]]
+                  if len(fails) > 10:
+                      lines.append("... and %d more" % (len(fails) - 10))
+              else:
+                  lines.append("health.json present, no healthcheck failures listed (failed after healthcheck or in deploy)")
+          except Exception:
+              lines.append("no health.json (failed before healthcheck)")
+          lines += ["", "Re-run: GitHub app → wihogan/PEC → Actions → refresh → Run workflow"]
+          open("alert.txt", "w", encoding="utf-8").write("\n".join(lines) + "\n")
+          PY
+          tools/notify_telegram.sh alert.txt
