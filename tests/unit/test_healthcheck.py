@@ -15,11 +15,35 @@ import pytest
 
 import healthcheck
 import refresh_v2
-from conftest import FIXTURES, REAL_CONFIG, TEMPLATE
+import re
+import tempfile
+from pathlib import Path
+
+from conftest import FIXTURES, REAL_CONFIG as _LIVE_CONFIG, TEMPLATE
 
 NOW = datetime.fromisoformat("2026-11-20T15:00:00-08:00")
 TODAY = NOW.date()
 RAW = json.loads((FIXTURES / "baseline_data_v2.json").read_text(encoding="utf-8"))
+
+
+def _config_matching_baseline() -> Path:
+    """The live config with its EPS manual_override pinned to the baseline fixture's value.
+
+    The owner updates the override in config/series_v2.yaml; these tests must not depend on it.
+    """
+    eps = RAW["valuation_inputs"]["forward_eps_ntm"]
+    text = _LIVE_CONFIG.read_text(encoding="utf-8")
+    block = re.search(r"manual_override:\n(?:[ \t]+.*\n){1,4}", text)
+    assert block, "manual_override block not found in config/series_v2.yaml"
+    seg = block.group(0)
+    seg = re.sub(r"(value:\s*)[0-9.]+", lambda m: f"{m.group(1)}{eps['value']}", seg, count=1)
+    seg = re.sub(r'(effective_date:\s*)"?[0-9-]+"?', lambda m: f'{m.group(1)}"{eps["effective_date"]}"', seg, count=1)
+    out = Path(tempfile.mkdtemp(prefix="pec_cfg_")) / "series_v2.yaml"
+    out.write_text(text[:block.start()] + seg + text[block.end():], encoding="utf-8")
+    return out
+
+
+REAL_CONFIG = _config_matching_baseline()
 CFG = refresh_v2._load_config(REAL_CONFIG)
 FREQ = {e["id"]: e["refresh_frequency"] for e in CFG["series"]}
 SOURCE = {e["id"]: e["source"] for e in CFG["series"]}
