@@ -34,10 +34,10 @@ on:
         description: 'EPS effective date YYYY-MM-DD (required with eps_value)'
         type: string
         default: ''
-  # ENABLE AFTER PHASE 3 GO
-  # schedule:
-  #   - cron: '17 22 * * 1-5'
-  #   - cron: '47 23 * * 1-5'
+  # Secondary trigger (primary = Mac launchd). Enabled after Phase 3 GO (docs/spike.md).
+  schedule:
+    - cron: '17 22 * * 1-5'
+    - cron: '47 23 * * 1-5'
 
 env:
   TZ: America/Los_Angeles
