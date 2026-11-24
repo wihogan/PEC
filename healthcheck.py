@@ -16,12 +16,13 @@ Hard-fail rules:
   3. PEC.html >= size floor, no unreplaced placeholders (outside HTML comments),
      and the <script id="pec-data"> body parses to JSON equal to data_v2.json.
   4. Source-level failures over series attempted this run:
-     > 3 failed market_daily series; all attempted FRED failed (>= 3 attempted);
+     > 3 failed intraday/daily_release series (reported as "market_daily"); all attempted FRED failed (>= 3 attempted);
      all attempted Yahoo failed (>= 3 attempted). Treasury / multpl: staleness only.
   5. Staleness of daily series (calendar days since last non-null observation).
-  6. valuation_inputs.forward_eps_ntm is the approved override from the config.
+  6. valuation_inputs.forward_eps_ntm is the config override (source override), or a FactSet
+     value (source factset) dated after the override's effective_date and within 200-600.
 
-Pure stdlib + PyYAML.
+Pure stdlib + PyYAML (and the repo's market_calendar).
 """
 from __future__ import annotations
 
@@ -36,26 +37,33 @@ from typing import Any, Optional
 
 import yaml
 
+import market_calendar
+
 HERE = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------------------
 # Thresholds (calendar days unless noted)
 # ---------------------------------------------------------------------------
+# Frequencies counted by rule 4 (formerly "market_daily"): intraday + daily_release.
+DAILY_FREQUENCIES = ("intraday", "daily_release")
+
 THRESHOLDS: dict = {
     # Hard fail when age > value. Per-id entry wins over per-frequency entry.
     # Only frequencies / ids listed here are gated; slow series are warn-only.
-    "fail_by_frequency": {"market_daily": 7, "daily_once": 7},
+    "fail_by_frequency": {"intraday": 7, "daily_release": 7},
     "fail_by_id": {
         "eur_usd": 14, "cad_usd": 14, "jpy_usd": 14,   # FRED FX (weekly H.10 batches)
         "wti_crude": 14,                                # FRED weekly batch
         "yield_curve": 7,
     },
     # Warn when age > value. Per-id entry wins over per-frequency entry.
-    "warn_by_frequency": {"monthly": 110, "quarterly": 300},
+    "warn_by_frequency": {"daily_after_close": 7, "monthly": 110, "quarterly": 300},
     "warn_by_id": {"sp500_earnings": 220},
     # Derived / valuation inputs (warn only).
     "warn_fwd_pe_history_days": 60,
     "warn_eps_effective_days": 45,
+    # Warn when the NYSE calendar table ends within this many days (m5)
+    "warn_calendar_end_days": 60,
     # Rule 3
     "html_min_bytes": 1_500_000,
     # Rule 4
@@ -219,10 +227,11 @@ def run_checks(data_path: Path, html_path: Path, config_path: Path, now: datetim
 
         # Rule 4: attempted this run
         def attempted(sid: str) -> bool:
+            # Attempted this run iff its last_attempt (old state: last_fetched) equals
+            # metadata.last_refreshed. A carried-forward error from an earlier run does not count.
             st = statuses.get(sid) or {}
-            if st.get("status") == "error":
-                return True
-            return bool(last_refreshed) and st.get("last_fetched") == last_refreshed
+            stamp = st.get("last_attempt") or st.get("last_fetched")
+            return bool(last_refreshed) and stamp == last_refreshed
 
         def failed(sid: str) -> bool:
             return (statuses.get(sid) or {}).get("status") == "error"
@@ -230,7 +239,8 @@ def run_checks(data_path: Path, html_path: Path, config_path: Path, now: datetim
         att = [sid for sid in cfg_series if attempted(sid)]
         md_failed = [
             s for s in att
-            if cfg_series[s].get("refresh_frequency") == "market_daily" and failed(s)
+            if cfg_series[s].get("refresh_frequency", "intraday") in DAILY_FREQUENCIES
+            and failed(s)
         ]
         if len(md_failed) > THRESHOLDS["max_failed_market_daily"]:
             failures.append(
@@ -250,7 +260,7 @@ def run_checks(data_path: Path, html_path: Path, config_path: Path, now: datetim
 
         # Rule 5 (fail) and slow-series warnings
         for sid, entry in cfg_series.items():
-            freq = entry.get("refresh_frequency", "market_daily")
+            freq = entry.get("refresh_frequency", "intraday")
             age = ages.get(sid)
             limit = _fail_threshold(sid, freq)
             if limit is not None:
@@ -278,21 +288,39 @@ def run_checks(data_path: Path, html_path: Path, config_path: Path, now: datetim
 
         # Rule 6 + EPS age warning
         eps = (data.get("valuation_inputs") or {}).get(EPS_VI_ID) or {}
-        if eps.get("source") != "override":
-            failures.append(
-                f"rule 6: {EPS_VI_ID} source is {eps.get('source')!r}, expected 'override'"
-            )
-        else:
+        eps_src = eps.get("source")
+        ok6 = False
+        if eps_src == "override":
             try:
-                same = abs(float(eps.get("value")) - float(cfg_eps.get("value"))) <= 1e-9
+                ok6 = abs(float(eps.get("value")) - float(cfg_eps.get("value"))) <= 1e-9
             except (TypeError, ValueError):
-                same = False
-            if not same:
+                ok6 = False
+            if not ok6:
                 failures.append(
                     f"rule 6: {EPS_VI_ID} value {eps.get('value')!r} does not match "
                     f"config override {cfg_eps.get('value')!r}"
                 )
-        eff = _to_date(eps.get("effective_date"))
+        elif eps_src == "factset":
+            as_of = _to_date(eps.get("as_of") or eps.get("effective_date"))
+            ov_date = _to_date(cfg_eps.get("effective_date"))
+            try:
+                in_range = 200.0 <= float(eps.get("value")) <= 600.0
+            except (TypeError, ValueError):
+                in_range = False
+            if as_of is None or (ov_date is not None and as_of <= ov_date):
+                failures.append(
+                    f"rule 6: {EPS_VI_ID} source is 'factset' but as_of {as_of} is not newer "
+                    f"than config override effective_date {ov_date}"
+                )
+            elif not in_range:
+                failures.append(
+                    f"rule 6: {EPS_VI_ID} factset value {eps.get('value')!r} outside 200-600"
+                )
+        else:
+            failures.append(
+                f"rule 6: {EPS_VI_ID} source is {eps_src!r}, expected 'override' or 'factset'"
+            )
+        eff = _to_date(eps.get("as_of") or eps.get("effective_date"))
         if eff is not None:
             eps_age = (today - eff).days
             if eps_age > THRESHOLDS["warn_eps_effective_days"]:
@@ -300,6 +328,15 @@ def run_checks(data_path: Path, html_path: Path, config_path: Path, now: datetim
                     f"{EPS_VI_ID} effective_date {eff.isoformat()} is {eps_age} days old "
                     f"(warn > {THRESHOLDS['warn_eps_effective_days']})"
                 )
+
+    # m5: the NYSE holiday table ends with market_calendar.CALENDAR_YEARS.
+    cal_end = date(max(market_calendar.CALENDAR_YEARS), 12, 31)
+    days_left = (cal_end - today).days
+    if days_left <= THRESHOLDS["warn_calendar_end_days"]:
+        warnings.append(
+            f"market_calendar covers NYSE holidays only to {cal_end.isoformat()} "
+            f"({days_left} days left); add the next year to market_calendar.py"
+        )
 
     # Rule 3 (runs even if rule 1 failed; script/data comparison skipped then)
     check_html(html_path, data, failures)

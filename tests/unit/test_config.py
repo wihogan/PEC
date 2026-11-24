@@ -9,7 +9,7 @@ from conftest import REAL_CONFIG
 from fetchers import multpl
 
 REQUIRED_FIELDS = ("id", "source", "series_id", "label", "category", "start_date", "refresh_frequency")
-FREQUENCIES = {"market_daily", "daily_once", "monthly", "quarterly"}
+FREQUENCIES = {"intraday", "daily_release", "daily_after_close", "monthly", "quarterly"}
 
 
 @pytest.fixture(scope="module")
@@ -34,7 +34,7 @@ def test_41_unique_series_ids(config):
 
 
 def test_registry_keys(registry):
-    assert set(registry) == {"fred", "yahoo", "treasury", "shiller", "spglobal", "multpl"}
+    assert set(registry) == {"fred", "yahoo", "treasury", "shiller", "spglobal", "multpl", "factset_eps"}
 
 
 def test_every_source_is_registered(config, registry):
@@ -95,3 +95,29 @@ def test_load_config_requires_series_key(tmp_path):
     p.write_text(yaml.safe_dump({"valuation_inputs": {}}))
     with pytest.raises(ValueError, match="series"):
         refresh_v2._load_config(p)
+
+
+def test_amendment_b_frequency_mapping(config):
+    by = {}
+    for e in config["series"]:
+        by.setdefault(e["refresh_frequency"], set()).add(e["id"])
+    src = {e["id"]: e["source"] for e in config["series"]}
+    assert by["intraday"] == {i for i, s in src.items() if s == "yahoo"} and len(by["intraday"]) == 14
+    assert by["daily_after_close"] == {i for i, s in src.items() if s == "multpl"} and len(by["daily_after_close"]) == 5
+    assert by["monthly"] == {"cpi_yoy", "nber_recession"}
+    assert by["quarterly"] == {"gdp_growth", "consumer_delinquency", "auto_loan_delinquency", "credit_card_delinquency"}
+    assert "yield_curve" in by["daily_release"]
+    assert len(by["daily_release"]) == 16
+    assert {src[i] for i in by["daily_release"]} == {"fred", "treasury"}
+    # every FRED series is daily_release unless monthly/quarterly
+    for i, s in src.items():
+        if s == "fred" and i not in by["monthly"] | by["quarterly"]:
+            assert i in by["daily_release"], i
+
+
+def test_publish_lag_bd_only_on_daily_release(config):
+    lagged = {e["id"]: e["publish_lag_bd"] for e in config["series"] if "publish_lag_bd" in e}
+    assert lagged == {"yield_curve": 0}
+    for e in config["series"]:
+        if "publish_lag_bd" in e:
+            assert e["refresh_frequency"] == "daily_release"

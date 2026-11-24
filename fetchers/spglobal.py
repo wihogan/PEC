@@ -33,6 +33,7 @@ import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -263,6 +264,66 @@ def _ensure_history(current_value: float) -> None:
             "[spglobal] _ensure_history raised unexpectedly: %s — skipping",
             exc,
         )
+
+
+def record_month_end(as_of: date, value: float, today: Optional[date] = None) -> bool:
+    """
+    Upsert the history entry for as_of's month (forward-EPS automation: FactSet or override).
+
+    - A month that has ended is dated its CALENDAR month-end (matches
+      config/forward_eps_seed.yaml, e.g. 2026-10-31). The in-progress month is dated
+      `as_of` (never a future date); once the month has ended, any such entry is
+      re-dated to the month-end the next time this function runs.
+    - An existing entry for the same year-month keeps its value unless it differs
+      (latest report of the month wins).
+    - Seed entries for months missing from the cache are merged in first, so adding
+      backfill rows to the seed also reaches an existing cache.
+    - Only the history cache is written (persisted on the state branch by
+      tools/state.sh). The seed file is NOT rewritten: write-back strips its comments
+      and the CI runner discards it anyway.
+    Returns True if the history cache was modified. Never raises.
+    """
+    try:
+        today = today or datetime.now(ZoneInfo("America/Los_Angeles")).date()
+        entries = _load_history_entries()
+        have = {str(e["date"])[:7] for e in entries}
+        modified = False
+        for e in _seed_history_from_yaml():
+            if e["date"][:7] not in have:
+                entries.append(e)
+                have.add(e["date"][:7])
+                modified = True  # seed rows must reach an existing cache (D3)
+        # Re-date entries of months that have since ended to their calendar month-end.
+        for e in entries:
+            d = date.fromisoformat(str(e["date"])[:10])
+            last = calendar.monthrange(d.year, d.month)[1]
+            month_end = date(d.year, d.month, last)
+            if d != month_end and month_end < today:
+                e["date"] = month_end.isoformat()
+                modified = True
+        if as_of > today:
+            as_of = today  # never key a future month (D6)
+        key = f"{as_of.year}-{as_of.month:02d}"
+        val = round(float(value), 2)
+        for e in entries:
+            if str(e["date"])[:7] == key:
+                if abs(float(e["value"]) - val) > 1e-9:
+                    e["value"] = val
+                    modified = True
+                break
+        else:
+            last_day = calendar.monthrange(as_of.year, as_of.month)[1]
+            month_end = date(as_of.year, as_of.month, last_day)
+            entry_date = month_end if month_end < today else min(as_of, today)
+            entries.append({"date": entry_date.isoformat(), "value": val})
+            modified = True
+        entries.sort(key=lambda e: str(e["date"]))
+        if modified or not _HISTORY_JSON.exists():
+            _save_history_entries(entries)
+        return modified
+    except Exception as exc:
+        log.warning("[spglobal] record_month_end failed: %s", exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +602,7 @@ def fetch(series_id: str, **kwargs) -> pd.DataFrame:
     Fallback chain (point-in-time)
     --------------
     1. S&P Global EPS xlsx (live download, 7-day cache).
-    2. FactSet Earnings Insight PDF / Yardeni chart page (factset_eps.py).
+    2. FactSet Earnings Insight PDF (factset_eps.py).
     3. .cache/forward_eps_ntm.json (last successful parse of any source).
     4. FetchError → triggers manual_override in refresh.py orchestrator.
 
@@ -595,15 +656,15 @@ def fetch(series_id: str, **kwargs) -> pd.DataFrame:
 
     except FetchError as exc:
         live_error_msg = str(exc)
-        log.warning("[spglobal] Live parse failed (%s) — trying FactSet/Yardeni", exc)
+        log.warning("[spglobal] Live parse failed (%s) — trying FactSet", exc)
     except Exception as exc:
         live_error_msg = str(exc)
         log.warning(
-            "[spglobal] Live parse raised unexpectedly (%s) — trying FactSet/Yardeni", exc
+            "[spglobal] Live parse raised unexpectedly (%s) — trying FactSet", exc
         )
 
     # ----------------------------------------------------------------
-    # Path 2: FactSet PDF / Yardeni page (factset_eps.py)
+    # Path 2: FactSet Earnings Insight PDF (factset_eps.py)
     # ----------------------------------------------------------------
     if value is None:
         try:
@@ -614,11 +675,11 @@ def fetch(series_id: str, **kwargs) -> pd.DataFrame:
                 as_of_str = result.get("as_of", date.today().isoformat())
                 effective_date = date.fromisoformat(as_of_str)
                 log.info(
-                    "[spglobal] FactSet/Yardeni: NTM EPS = $%.2f  source=%s  as_of=%s",
+                    "[spglobal] FactSet: NTM EPS = $%.2f  source=%s  as_of=%s",
                     value, result.get("source", "?"), as_of_str,
                 )
         except Exception as exc:
-            log.warning("[spglobal] FactSet/Yardeni fetch failed: %s", exc)
+            log.warning("[spglobal] FactSet fetch failed: %s", exc)
 
     # ----------------------------------------------------------------
     # Path 3: JSON cache (last successful parse of any upstream source)

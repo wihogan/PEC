@@ -29,7 +29,7 @@ if str(REPO) not in sys.path:
 # Importing refresh_v2 runs sys.stdout.reconfigure() and logging.basicConfig();
 # both are verified to work under every pytest capture mode (fd, sys, no).
 import refresh_v2  # noqa: E402
-from fetchers import multpl, spglobal, yahoo  # noqa: E402
+from fetchers import factset_eps, multpl, spglobal, yahoo  # noqa: E402
 
 REAL_CONFIG = REPO / "config" / "series_v2.yaml"
 REAL_SEED = REPO / "config" / "forward_eps_seed.yaml"
@@ -56,12 +56,18 @@ def isolate_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(spglobal, "_HISTORY_JSON", cache / "forward_eps_ntm_history.json")
     monkeypatch.setattr(spglobal, "_SEED_YAML", seed)
 
+    monkeypatch.setattr(factset_eps, "_CACHE_DIR", cache)
+    monkeypatch.setattr(factset_eps, "_FACTSET_CACHE", cache / "factset_eps_latest.json")
+    # EPS_CHANGE_FLAG is bound to the real HERE at import time; redirect it too.
+    monkeypatch.setattr(refresh_v2, "EPS_CHANGE_FLAG", here / "eps_change.txt")
+
     monkeypatch.setattr(multpl, "_CACHE_DIR", cache)
     monkeypatch.setattr(yahoo, "_CACHE_DIR", cache)
 
     # Never let a unit test see a real key; neutralise workflow-level env
     # (refresh.yml sets PEC_EPS_OVERRIDE_ONLY=1 for the job that also runs pytest).
-    for var in ("FRED_API_KEY", "PEC_EPS_OVERRIDE_ONLY", "GITHUB_RUN_ID"):
+    # refresh.yml also sets PEC_EPS_MODE=factset at workflow level.
+    for var in ("FRED_API_KEY", "PEC_EPS_OVERRIDE_ONLY", "PEC_EPS_MODE", "GITHUB_RUN_ID"):
         monkeypatch.delenv(var, raising=False)
     return tmp_path
 

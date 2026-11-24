@@ -126,8 +126,11 @@ def set_status(d, sid, status, attempted=True):
     if status == "error":
         st["error"] = f"{sid} boom"
         st["last_fetched"] = "2026-11-19T14:17:00"
+        # QA M1: run() stamps every attempt; a carried-forward error keeps an older stamp
+        st["last_attempt"] = lr if attempted else "2026-11-19T14:17:00"
     else:
         st["last_fetched"] = lr if attempted else "2026-11-02T06:40:35"
+        st["last_attempt"] = st["last_fetched"]
     d["metadata"]["statuses"][sid] = st
 
 
@@ -281,12 +284,12 @@ def test_rule3_html_missing(pass_files, tmp_path):
 # ---------------------------------------------------------------------------
 # Rule 4
 # ---------------------------------------------------------------------------
-MD_MIXED = ["dow_jones", "nasdaq", "fed_funds", "gold_spot"]   # yahoo + fred, all market_daily
+MD_MIXED = ["dow_jones", "nasdaq", "fed_funds", "gold_spot"]   # yahoo intraday + fred daily_release
 
 
 def test_rule4_fixture_assumptions():
     for sid in MD_MIXED:
-        assert FREQ[sid] == "market_daily"
+        assert FREQ[sid] in healthcheck.DAILY_FREQUENCIES
     assert {SOURCE[s] for s in MD_MIXED} == {"yahoo", "fred"}
 
 
@@ -375,8 +378,10 @@ def test_rule4_attempted_definition(mutated):
 @pytest.mark.parametrize(
     "sid, ok_age, bad_age",
     [
-        ("sp500", 7, 8),            # market_daily 7
-        ("treasury_10yr", 7, 8),    # FRED daily, market_daily
+        ("sp500", 7, 8),            # intraday 7
+        ("btc_usd", 7, 8),          # intraday (crypto)
+        ("treasury_10yr", 7, 8),    # daily_release 7
+        ("tips_5yr", 7, 8),
         ("eur_usd", 14, 15),        # FRED FX 14 (NB2)
         ("cad_usd", 14, 15),
         ("jpy_usd", 14, 15),
@@ -432,7 +437,8 @@ def test_rule5_slow_series_never_fail(mutated):
         set_last_obs(d, "sp500_earnings", days_ago(400))
     r = check(mutated(fn))
     assert r["failures"] == []
-    assert len([w for w in r["warnings"] if "days old (warn >" in w and "forward_eps" not in w and "fwd_pe" not in w]) == 3
+    warned = {w.split()[0] for w in r["warnings"] if "days old (warn >" in w}
+    assert {"cpi_yoy", "gdp_growth", "sp500_earnings"} <= warned
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +448,7 @@ def test_rule6_live_source_fails(mutated):
     def fn(d):
         d["valuation_inputs"]["forward_eps_ntm"]["source"] = "live"
     r = check(mutated(fn))
-    assert r["failures"] == ["rule 6: forward_eps_ntm source is 'live', expected 'override'"]
+    assert r["failures"] == ["rule 6: forward_eps_ntm source is 'live', expected 'override' or 'factset'"]
 
 
 def test_rule6_override_value_mismatch_fails(mutated):
@@ -541,3 +547,189 @@ def test_cli_missing_data_still_writes_report(pass_files, tmp_path):
                            "--config", str(REAL_CONFIG), "--out", str(out), "--now", "2026-11-20T15:00:00"])
     assert rc == 1
     assert json.loads(out.read_text())["failures"][0].startswith("rule 1")
+
+
+# ---------------------------------------------------------------------------
+# Amendment B mapping
+# ---------------------------------------------------------------------------
+def test_daily_frequencies_constant():
+    assert healthcheck.DAILY_FREQUENCIES == ("intraday", "daily_release")
+    assert set(healthcheck.THRESHOLDS["fail_by_frequency"]) == {"intraday", "daily_release"}
+
+
+def test_rule4_counts_daily_release_and_intraday_not_after_close(mutated):
+    """4 failures among intraday+daily_release fail; multpl (daily_after_close) never counts."""
+    def fn(d):
+        for sid in ["fed_funds", "treasury_10yr", "dow_jones", "sp500_pe", "shiller_cape"]:
+            set_status(d, sid, "error")
+    assert check(mutated(fn))["failures"] == []      # only 3 daily-type failures
+
+    def fn4(d):
+        fn(d)
+        set_status(d, "hy_yield", "error")
+    r = check(mutated(fn4))
+    assert rules(r) == ["rule 4"] and "4 market_daily series failed" in r["failures"][0]
+
+
+@pytest.mark.parametrize("sid", ["sp500_pe", "shiller_cape", "sp500_dividend_yield", "sp500_earnings_yield"])
+def test_daily_after_close_warn_only_after_7_days(mutated, sid):
+    r = check(mutated(lambda d: set_last_obs(d, sid, days_ago(7))))
+    assert not [w for w in r["warnings"] if w.startswith(f"{sid} last observation")]
+    r = check(mutated(lambda d: set_last_obs(d, sid, days_ago(400))))
+    assert r["failures"] == []
+    assert f"{sid} last observation is 400 days old (warn > 7)" in r["warnings"]
+
+
+def test_sp500_earnings_keeps_220_day_warning(mutated):
+    r = check(mutated(lambda d: set_last_obs(d, "sp500_earnings", days_ago(100))))
+    assert not [w for w in r["warnings"] if w.startswith("sp500_earnings last observation")]
+
+
+# ---------------------------------------------------------------------------
+# Negative age (crypto bars dated in UTC, docs/spike.md follow-up)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("sid", ["btc_usd", "eth_usd", "xrp_usd"])
+def test_negative_age_passes(mutated, sid):
+    tomorrow = TODAY + timedelta(days=1)
+    r = check(mutated(lambda d: set_last_obs(d, sid, tomorrow, value=90000.0)))
+    assert r["failures"] == []
+    assert r["series"][sid]["age_days"] == -1
+    assert r["series"][sid]["last_obs"] == tomorrow.isoformat()
+    assert not [w for w in r["warnings"] if w.startswith(sid)]
+
+
+# ---------------------------------------------------------------------------
+# Rule 6 with source 'factset' (FactSet automation)
+# ---------------------------------------------------------------------------
+OV_DATE = date.fromisoformat(str(CFG["valuation_inputs"]["forward_eps_ntm"]["manual_override"]["effective_date"]))
+
+
+def _factset(as_of, value=419.64, effective_date=None, drop_as_of=False):
+    def fn(d):
+        eps = d["valuation_inputs"]["forward_eps_ntm"]
+        eps.update(source="factset", value=value, url="https://x/EarningsInsight_112026A.pdf")
+        eps["effective_date"] = effective_date if effective_date is not None else as_of
+        if drop_as_of:
+            eps.pop("as_of", None)
+        else:
+            eps["as_of"] = as_of
+    return fn
+
+
+def test_rule6_factset_newer_than_override_passes(mutated):
+    newer = (OV_DATE + timedelta(days=1)).isoformat()
+    r = check(mutated(_factset(newer)))
+    assert r["failures"] == []
+
+
+@pytest.mark.parametrize("delta_days", [0, -7])
+def test_rule6_factset_not_newer_than_override_fails(mutated, delta_days):
+    as_of = (OV_DATE + timedelta(days=delta_days)).isoformat()
+    r = check(mutated(_factset(as_of)))
+    assert rules(r) == ["rule 6"] and "is not newer than config override effective_date" in r["failures"][0]
+
+
+@pytest.mark.parametrize("value", [199.99, 600.01, None, "abc"])
+def test_rule6_factset_value_out_of_range_fails(mutated, value):
+    newer = (OV_DATE + timedelta(days=1)).isoformat()
+    r = check(mutated(_factset(newer, value=value)))
+    assert rules(r) == ["rule 6"]
+
+
+@pytest.mark.parametrize("value", [200.0, 600.0])
+def test_rule6_factset_range_inclusive(mutated, value):
+    newer = (OV_DATE + timedelta(days=1)).isoformat()
+    assert check(mutated(_factset(newer, value=value)))["failures"] == []
+
+
+def test_rule6_factset_uses_effective_date_when_as_of_missing(mutated):
+    newer = (OV_DATE + timedelta(days=1)).isoformat()
+    assert check(mutated(_factset(None, effective_date=newer, drop_as_of=True)))["failures"] == []
+
+
+def test_rule6_factset_without_any_date_fails(mutated):
+    r = check(mutated(_factset(None, effective_date="", drop_as_of=True)))
+    assert rules(r) == ["rule 6"]
+
+
+def test_rule6_factset_value_need_not_equal_override(mutated):
+    newer = (OV_DATE + timedelta(days=1)).isoformat()
+    assert check(mutated(_factset(newer, value=555.55)))["failures"] == []
+
+
+def test_rule6_factset_age_warning_uses_as_of(mutated):
+    r = check(mutated(_factset(TODAY.isoformat())))
+    assert not [w for w in r["warnings"] if w.startswith("forward_eps_ntm effective_date")]
+    old = (TODAY - timedelta(days=46))
+    if old > OV_DATE:
+        r = check(mutated(_factset(old.isoformat())))
+        assert any("46 days old" in w for w in r["warnings"])
+
+
+
+# ---------------------------------------------------------------------------
+# QA M1: attempted() keys on last_attempt (fallback last_fetched)
+# ---------------------------------------------------------------------------
+def test_rule4_carried_forward_slow_errors_do_not_count(mutated):
+    """QA M1 reproduction: 3 slow FRED series stuck in error from an earlier run, and a run
+    that fetched only other series -> rule 4 must not fire."""
+    def fn(d):
+        _only_attempted(d, "fred", [])
+        for sid in FRED_SLOW:
+            set_status(d, sid, "error", attempted=False)
+    r = check(mutated(fn))
+    assert r["failures"] == []
+    assert sum(w.endswith("boom") for w in r["warnings"]) == 3      # still warned
+
+
+def _old_state(d, sid, status, stamp):
+    """Status record written before the QA fixes: no last_attempt."""
+    st = {"status": status, "last_fetched": stamp}
+    if status == "error":
+        st["error"] = f"{sid} boom"
+    d["metadata"]["statuses"][sid] = st
+
+
+def test_rule4_old_state_without_last_attempt_ok_counts_via_last_fetched(mutated):
+    def fn(d):
+        _only_attempted(d, "fred", FRED_SLOW)
+        _old_state(d, "fed_funds", "ok", d["metadata"]["last_refreshed"])   # attempted via last_fetched
+    assert check(mutated(fn))["failures"] == []
+
+
+def test_rule4_old_state_errors_without_last_attempt_not_counted(mutated):
+    """Old-state compatibility: an error record without last_attempt carries the last success
+    stamp, which is not this run, so it is not counted as attempted."""
+    def fn(d):
+        _only_attempted(d, "fred", [])
+        for sid in FRED_SLOW:
+            _old_state(d, sid, "error", "2026-11-02T06:40:35")
+    assert check(mutated(fn))["failures"] == []
+
+
+def test_rule4_last_attempt_wins_over_last_fetched(mutated):
+    def fn(d):
+        lr = d["metadata"]["last_refreshed"]
+        _only_attempted(d, "fred", FRED_SLOW)
+        # last_fetched equals last_refreshed but last_attempt is older -> not attempted
+        d["metadata"]["statuses"]["fed_funds"] = {"status": "ok", "last_fetched": lr, "last_attempt": "2026-11-01T00:00:00"}
+    assert rules(check(mutated(fn))) == ["rule 4"]
+
+
+def test_rule4_no_last_refreshed_nothing_attempted(mutated):
+    def fn(d):
+        for sid in MD_MIXED:
+            set_status(d, sid, "error")
+        d["metadata"]["last_refreshed"] = None
+    assert "rule 4" not in rules(check(mutated(fn)))
+
+
+# ---------------------------------------------------------------------------
+# m5: calendar-end warning
+# ---------------------------------------------------------------------------
+def test_calendar_end_warning(pass_files):
+    end = date(max(__import__("market_calendar").CALENDAR_YEARS), 12, 31)
+    r = check(pass_files, now=datetime.combine(end - timedelta(days=61), datetime.min.time()).astimezone())
+    assert not [w for w in r["warnings"] if w.startswith("market_calendar")]
+    r = check(pass_files, now=datetime.combine(end - timedelta(days=60), datetime.min.time()).astimezone())
+    assert f"market_calendar covers NYSE holidays only to {end.isoformat()} (60 days left); add the next year to market_calendar.py" in r["warnings"]

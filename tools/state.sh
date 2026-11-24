@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Persist data_v2.json on an orphan branch (plan sections 2-3).
+# Persist data_v2.json (plus the optional EPS cache files) on an orphan branch (plan sections 2-3).
+# Optional files live in .cache/ locally and at the branch root on the state branch:
+# the forward-EPS month-end history (the runner discards config/forward_eps_seed.yaml
+# write-back) and the FactSet once-per-day cache.
 # Usage: tools/state.sh restore <ref> | save <ref>     (ref: state | state-test)
 set -euo pipefail
 
@@ -14,6 +17,7 @@ root="$(git rev-parse --show-toplevel)"
 cd "$root"
 FILE="data_v2.json"
 BASELINE="tests/fixtures/baseline_data_v2.json"
+OPTIONAL_FILES=(forward_eps_ntm_history.json factset_eps_latest.json)
 
 restore() {
   local out
@@ -37,6 +41,18 @@ restore() {
   fi
   mv "${FILE}.tmp" "$FILE"
   echo "state.sh: restored ${FILE} from '${ref}'"
+  # Optional files: absence on the branch is normal (first run after this feature).
+  local f
+  mkdir -p .cache
+  for f in "${OPTIONAL_FILES[@]}"; do
+    if git show "FETCH_HEAD:${f}" > ".cache/${f}.tmp" 2>/dev/null; then
+      mv ".cache/${f}.tmp" ".cache/${f}"
+      echo "state.sh: restored .cache/${f} from '${ref}'"
+    else
+      rm -f ".cache/${f}.tmp"
+      echo "state.sh: ${f} not on '${ref}' (ok)"
+    fi
+  done
 }
 
 save() {
@@ -53,6 +69,12 @@ save() {
     find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
     cp "${root}/${FILE}" "$FILE"
     git add "$FILE"
+    for f in "${OPTIONAL_FILES[@]}"; do
+      if [ -f "${root}/.cache/${f}" ]; then
+        cp "${root}/.cache/${f}" "$f"
+        git add "$f"
+      fi
+    done
     git -c user.name="github-actions[bot]" \
         -c user.email="41898579+github-actions[bot]@users.noreply.github.com" \
         commit -q -m "state: ${FILE} $(date -u +%Y-%m-%dT%H:%M:%SZ)"

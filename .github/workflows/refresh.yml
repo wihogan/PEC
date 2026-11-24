@@ -41,7 +41,7 @@ on:
 
 env:
   TZ: America/Los_Angeles
-  PEC_EPS_OVERRIDE_ONLY: '1'
+  PEC_EPS_MODE: factset
 
 jobs:
   refresh:
@@ -52,6 +52,7 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: write
+      actions: read
     outputs:
       deploy: ${{ steps.norm.outputs.deploy }}
       state_ref: ${{ steps.norm.outputs.state_ref }}
@@ -95,6 +96,14 @@ jobs:
           if [ -n "$eps_value" ] && [ -z "$eps_date" ]; then die "eps_value requires eps_date"; fi
           if [ -z "$eps_value" ] && [ -n "$eps_date" ]; then die "eps_date requires eps_value"; fi
           # Guards (plan section 1)
+          # Production state is only touched from main (m1); test state never reaches the live page (m2).
+          if [ "$state_ref" = "state" ] && [ "$GIT_REF" != "refs/heads/main" ]; then
+            die "state_ref=state must run from main (use state-test on other branches)"
+          fi
+          if [ "$state_ref" != "state" ] && [ "$deploy" = "true" ]; then
+            echo "state_ref=$state_ref: forcing deploy=false (test state is never published)"
+            deploy=false
+          fi
           if [ "$state_ref" = "state" ]; then
             if [ "$inject" != "none" ] && [ "$inject" != "bad_fred_key" ]; then
               die "on state_ref=state the only allowed inject is bad_fred_key"
@@ -104,11 +113,6 @@ jobs:
             fi
             if [ -n "$eps_value" ] && [ "$GIT_REF" != "refs/heads/main" ]; then
               die "eps_value on state_ref=state must run from main"
-            fi
-          else
-            # Never publish test/injected data to the live page.
-            if [ "$deploy" = "true" ] && [ "$inject" != "none" ]; then
-              die "deploy=true is not allowed together with an inject on state-test"
             fi
           fi
           {
@@ -121,9 +125,9 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "normalised: force=$force deploy=$deploy state_ref=$state_ref inject=$inject eps_value=${eps_value:-<none>}"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
           cache: pip
@@ -216,12 +220,25 @@ jobs:
       - name: Secret leak scan
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-        run: tools/leak_scan.sh PEC.html data_v2.json health.json
+        run: tools/leak_scan.sh PEC.html data_v2.json health.json refresh.log
 
       - name: Save state
         env:
           STATE_REF: ${{ steps.norm.outputs.state_ref }}
         run: tools/state.sh save "$STATE_REF"
+
+      - name: Notify forward EPS change
+        if: steps.norm.outputs.state_ref == 'state'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -uo pipefail
+          if [ -f eps_change.txt ]; then
+            tools/notify_telegram.sh eps_change.txt || echo "::warning::EPS change notification failed"
+          else
+            echo "no forward EPS change to report"
+          fi
 
       - name: Keep-alive
         if: github.event_name == 'schedule' || (steps.norm.outputs.state_ref == 'state' && steps.norm.outputs.inject == 'none')
@@ -248,15 +265,44 @@ jobs:
           cp PEC.html _site/index.html
           cp health.json _site/health.json
 
+      - name: Recovery notice
+        if: steps.norm.outputs.state_ref == 'state' && steps.norm.outputs.inject == 'none'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          prev="$(tools/pec_runs.sh previous "$RUN_ID")"
+          echo "previous production run: $prev"
+          if [ "$prev" = "failure" ]; then
+            printf '✅ PEC recovered\nrun: %s\n' "$RUN_URL" > recovered.txt
+            tools/notify_telegram.sh recovered.txt || echo "::warning::recovery notification failed"
+          fi
+
       - name: Upload Pages artifact
         if: steps.norm.outputs.deploy == 'true'
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: _site
 
-      - name: Upload health and log
+      - name: Scan log before upload
+        id: logscan
         if: always()
-        uses: actions/upload-artifact@v4
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: |
+          set -uo pipefail
+          files=()
+          for f in refresh.log health.json; do [ -f "$f" ] && files+=("$f"); done
+          if [ "${#files[@]}" -eq 0 ]; then echo "nothing to scan"; exit 0; fi
+          tools/leak_scan.sh "${files[@]}"
+
+      - name: Upload health and log
+        if: always() && steps.logscan.outcome == 'success'
+        uses: actions/upload-artifact@v7
         with:
           name: pec-health-${{ github.run_id }}
           path: |
@@ -278,29 +324,60 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
   notify:
     needs: [refresh, deploy]
-    if: >-
-      always() && (
-        needs.refresh.result == 'failure' || needs.deploy.result == 'failure' ||
-        needs.refresh.result == 'cancelled' || needs.deploy.result == 'cancelled')
+    # Cancelled runs (concurrency group or a manual cancel) never alert.
+    if: always() && (needs.refresh.result == 'failure' || needs.deploy.result == 'failure')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
+      actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Decide whether to alert
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          STATE_REF: ${{ needs.refresh.outputs.state_ref || inputs.state_ref || 'state' }}
+        run: |
+          set -uo pipefail
+          send=true; why="test run"
+          if [ "$STATE_REF" != "state-test" ]; then
+            # Post-close / retry slots (13:00-16:30 PT) always alert.
+            started="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" -q .run_started_at 2>/dev/null || true)"
+            hm=""
+            if [ -n "$started" ]; then
+              hm="$(TZ=America/Los_Angeles date -d "$started" +%H%M 2>/dev/null || true)"
+            fi
+            if [ -n "$hm" ] && [ "$hm" -ge 1300 ] && [ "$hm" -le 1630 ]; then
+              send=true; why="post-close slot (${hm} PT)"
+            else
+              n="$(tools/pec_runs.sh failures-today "$RUN_ID")"
+              if [ "${n:-0}" -gt 0 ]; then
+                send=false; why="not the first failed production run today (${n} earlier)"
+              else
+                send=true; why="first failed production run today"
+              fi
+            fi
+          fi
+          echo "alert decision: send=$send ($why)"
+          echo "send=$send" >> "$GITHUB_OUTPUT"
 
       - name: Download health artifact
+        if: steps.decide.outputs.send == 'true'
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: pec-health-${{ github.run_id }}
           path: health_dl
 
       - name: Compose and send Telegram alert
+        if: steps.decide.outputs.send == 'true'
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

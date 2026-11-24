@@ -1,5 +1,5 @@
 # Test-only dependencies. Install on top of requirements.txt:
 #   .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
-# pytest is pinned to the same version as requirements.txt so the two files never conflict.
+# pytest itself is pinned here (it is not in requirements.txt); pytest-socket blocks network in tests.
 pytest==9.0.3
 pytest-socket==0.8.1

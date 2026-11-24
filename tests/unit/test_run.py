@@ -20,14 +20,14 @@ NOW_TS = "2026-11-20T14:17:00"
 
 CONFIG = {
     "series": [
-        {"id": "sp500", "source": "yahoo", "series_id": "^GSPC", "label": "S&P", "refresh_frequency": "market_daily"},
-        {"id": "treasury_10yr", "source": "fred", "series_id": "DGS10", "label": "10y", "refresh_frequency": "market_daily"},
+        {"id": "sp500", "source": "yahoo", "series_id": "^GSPC", "label": "S&P", "refresh_frequency": "intraday"},
+        {"id": "treasury_10yr", "source": "fred", "series_id": "DGS10", "label": "10y", "refresh_frequency": "daily_release"},
         {"id": "cpi_yoy", "source": "fred", "series_id": "CPIAUCSL", "label": "CPI", "refresh_frequency": "monthly", "yoy_pct": True},
         {"id": "gdp_growth", "source": "fred", "series_id": "GDPX", "label": "GDP", "refresh_frequency": "quarterly"},
-        {"id": "dow_jones", "source": "yahoo", "series_id": "^BOGUS", "label": "Dow", "refresh_frequency": "market_daily"},
-        {"id": "brand_new", "source": "yahoo", "series_id": "^FAIL", "label": "New", "refresh_frequency": "market_daily"},
+        {"id": "dow_jones", "source": "yahoo", "series_id": "^BOGUS", "label": "Dow", "refresh_frequency": "intraday"},
+        {"id": "brand_new", "source": "yahoo", "series_id": "^FAIL", "label": "New", "refresh_frequency": "intraday"},
         {"id": "nber_recession", "source": "fred", "series_id": "USREC", "label": "NBER", "refresh_frequency": "monthly"},
-        {"id": "yield_curve", "source": "treasury", "series_id": "daily_treasury_yield_curve", "label": "YC", "refresh_frequency": "daily_once"},
+        {"id": "yield_curve", "source": "treasury", "series_id": "daily_treasury_yield_curve", "label": "YC", "refresh_frequency": "daily_release", "publish_lag_bd": 0},
     ],
     "valuation_inputs": {
         "forward_eps_ntm": {
@@ -45,18 +45,18 @@ PRIOR = {
         "statuses": {
             "sp500": {"status": "ok", "last_fetched": "2026-11-19T14:17:00"},
             "treasury_10yr": {"status": "ok", "last_fetched": "2026-11-19T14:17:00"},
-            "cpi_yoy": {"status": "ok", "last_fetched": "2026-11-02T14:17:00"},        # current month -> skip
-            "gdp_growth": {"status": "ok", "last_fetched": "2026-10-01T14:17:00"},     # current quarter -> skip
+            "cpi_yoy": {"status": "ok", "last_fetched": "2026-11-17T14:17:00"},        # Oct obs present, 3 d -> skip
+            "gdp_growth": {"status": "ok", "last_fetched": "2026-11-17T14:17:00"},     # Q3 obs present, 3 d -> skip
             "dow_jones": {"status": "ok", "last_fetched": "2026-11-19T14:17:00"},
-            "nber_recession": {"status": "ok", "last_fetched": "2026-11-02T14:17:00"},  # current, but no data
+            "nber_recession": {"status": "ok", "last_fetched": "2026-11-02T14:17:00"},  # no data -> due (throttle: not today)
             "yield_curve": {"status": "ok", "last_fetched": "2026-11-19T14:17:00"},
         },
     },
     "series": {
         "sp500": {"dates": ["2026-11-19"], "values": [6800.0]},
-        "treasury_10yr": {"dates": ["2026-11-19"], "values": [4.1]},
-        "cpi_yoy": {"dates": ["2026-09-01"], "values": [2.9]},
-        "gdp_growth": {"dates": ["2026-04-01"], "values": [2.1]},
+        "treasury_10yr": {"dates": ["2026-11-18"], "values": [4.1]},   # lag 1 expects Thu 19 -> due
+        "cpi_yoy": {"dates": ["2026-10-01"], "values": [2.9]},
+        "gdp_growth": {"dates": ["2026-07-01"], "values": [2.1]},
         "dow_jones": {"dates": ["2026-11-19"], "values": [44000.0]},
         "yield_curve": {"dates": ["2026-11-19"], "tenors": {"10yr": [4.1]}},
     },
@@ -146,7 +146,7 @@ def test_run_statuses_counts_and_carry_forward(env):
 
     # fetched OK
     for sid in ("sp500", "treasury_10yr", "nber_recession", "yield_curve"):
-        assert st[sid] == {"status": "ok", "last_fetched": NOW_TS}, sid
+        assert st[sid] == {"status": "ok", "last_fetched": NOW_TS, "last_attempt": NOW_TS}, sid
     assert series["sp500"] == {"dates": ["2026-11-19", "2026-11-20"], "values": [6800.0, 6900.1235]}
     assert series["yield_curve"] == {"dates": ["2026-11-20"], "tenors": {"1mo": [3.9], "10yr": [4.0]}}
 
@@ -160,17 +160,19 @@ def test_run_statuses_counts_and_carry_forward(env):
     assert st["dow_jones"]["status"] == "error"
     assert "^BOGUS" in st["dow_jones"]["error"]
     assert st["dow_jones"]["last_fetched"] == "2026-11-19T14:17:00"
+    assert st["dow_jones"]["last_attempt"] == NOW_TS            # QA M1: every attempt stamped
 
     # failure without prior data: absent from series, last_fetched None
     assert "brand_new" not in series
     assert st["brand_new"]["status"] == "error" and st["brand_new"]["last_fetched"] is None
+    assert st["brand_new"]["last_attempt"] == NOW_TS
 
 
 def test_run_does_not_call_fetchers_for_skipped_series(env):
     refresh_v2.run()
     fetched = [kw["series_id"] for src, kw in env.calls if src in ("yahoo", "fred")]
     assert "CPIAUCSL" not in fetched and "GDPX" not in fetched
-    # "current" per frequency but absent from prior series -> fetched anyway
+    # monthly with no stored data and not fetched today -> fetched
     assert "USREC" in fetched
 
 
@@ -181,7 +183,7 @@ def test_run_valuation_falls_back_to_override(env):
     assert eps["source"] == "override"
     assert eps["value"] == 354.84 and eps["effective_date"] == "2026-05-07"
     assert len(eps["history"]["dates"]) == 30
-    assert out["metadata"]["statuses"]["forward_eps_ntm"] == {"status": "ok"}
+    assert out["metadata"]["statuses"]["forward_eps_ntm"] == {"status": "ok", "last_attempt": NOW_TS}
     sp_calls = [kw for src, kw in env.calls if src == "spglobal"]
     assert sp_calls == [{"series_id": "forward_eps_ntm"}, {"series_id": "forward_eps_ntm", "history": True}]
 
@@ -318,7 +320,7 @@ def test_override_only_never_calls_live_point_fetch(env, monkeypatch):
     assert eps["source"] == "override"
     assert eps["value"] == 354.84 and eps["effective_date"] == "2026-05-07"
     assert len(eps["history"]["dates"]) == 30
-    assert out["metadata"]["statuses"]["forward_eps_ntm"] == {"status": "ok"}
+    assert out["metadata"]["statuses"]["forward_eps_ntm"] == {"status": "ok", "last_attempt": NOW_TS}
 
     # fwd_pe_history still built from the EPS history (30 months, Jan 2024..Jun 2026)
     fph = out["series"]["fwd_pe_history"]
@@ -341,7 +343,7 @@ def test_override_only_without_override_is_unavailable(env, monkeypatch, tmp_pat
     refresh_v2.run()
     out = _out()
     assert out["valuation_inputs"]["forward_eps_ntm"]["source"] == "unavailable"
-    assert out["metadata"]["statuses"]["forward_eps_ntm"] == {"status": "warning", "error": "no data source available"}
+    assert out["metadata"]["statuses"]["forward_eps_ntm"] == {"status": "warning", "error": "no data source available", "last_attempt": NOW_TS}
     assert [kw for src, kw in env.calls if src == "spglobal"] == []
 
 
@@ -380,7 +382,88 @@ def test_fetch_valuation_inputs_direct_override_only(monkeypatch):
             "effective_date": "2026-05-07",
             "source": "override",
             "history": {"dates": ["2026-04-30"], "values": [346.19]},
+            "as_of": "2026-05-07",   # EPS-mode records carry as_of/url
+            "url": None,
         }
     }
     assert calls == [{"history": True}]
     assert statuses == {"forward_eps_ntm": {"status": "ok"}}
+
+
+def test_run_passes_last_obs_and_publish_lag(env, monkeypatch):
+    seen = {}
+    real = refresh_v2._needs_refresh
+
+    def spy(sid, frequency, existing_statuses, last_obs=None, publish_lag_bd=0, now=None, session_series=True):
+        seen[sid] = (frequency, last_obs, publish_lag_bd)
+        sessions[sid] = session_series
+        return real(sid, frequency, existing_statuses, last_obs=last_obs, publish_lag_bd=publish_lag_bd,
+                    now=now, session_series=session_series)
+
+    sessions = {}
+
+    monkeypatch.setattr(refresh_v2, "_needs_refresh", spy)
+    refresh_v2.run()
+    from datetime import date
+    assert seen["treasury_10yr"] == ("daily_release", date(2026, 11, 18), 1)   # FRED default lag 1
+    assert seen["yield_curve"] == ("daily_release", date(2026, 11, 19), 0)     # explicit 0
+    assert seen["sp500"] == ("intraday", date(2026, 11, 19), 0)
+    assert seen["cpi_yoy"] == ("monthly", date(2026, 10, 1), 0)
+    assert seen["nber_recession"] == ("monthly", None, 0)
+
+
+def test_run_last_fetched_is_pt_regardless_of_process_tz(env, monkeypatch):
+    from conftest import set_tz
+    with set_tz("UTC"):
+        refresh_v2.run()
+    out = _out()
+    assert out["metadata"]["last_refreshed"] == NOW_TS          # 14:17 PT, not 22:17 UTC
+    assert out["metadata"]["statuses"]["sp500"]["last_fetched"] == NOW_TS
+
+
+def test_run_session_series_false_only_for_crypto(env, monkeypatch):
+    seen = {}
+    real = refresh_v2._needs_refresh
+
+    def spy(sid, frequency, existing_statuses, **kw):
+        seen[sid] = kw.get("session_series")
+        return real(sid, frequency, existing_statuses, **kw)
+
+    monkeypatch.setattr(refresh_v2, "_needs_refresh", spy)
+    cfg = json.loads(json.dumps(CONFIG))
+    cfg["series"].append({"id": "btc_usd", "source": "yahoo", "series_id": "BTC-USD", "label": "BTC",
+                          "refresh_frequency": "intraday"})
+    p = refresh_v2.CONFIG_PATH.parent / "series_btc.yaml"
+    p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    monkeypatch.setattr(refresh_v2, "CONFIG_PATH", p)
+    refresh_v2.run()
+    assert seen["btc_usd"] is False
+    assert seen["sp500"] is True and seen["dow_jones"] is True and seen["cpi_yoy"] is True
+
+
+def test_run_skip_carries_status_including_old_last_attempt(env):
+    prior = json.loads(json.dumps(PRIOR))
+    prior["metadata"]["statuses"]["cpi_yoy"]["last_attempt"] = "2026-11-18T06:45:00"
+    refresh_v2.OUTPUT_PATH.write_text(json.dumps(prior), encoding="utf-8")
+    refresh_v2.run()
+    assert _out()["metadata"]["statuses"]["cpi_yoy"] == prior["metadata"]["statuses"]["cpi_yoy"]
+
+
+def test_run_weekly_revision_refetches_slow_series(env):
+    prior = json.loads(json.dumps(PRIOR))
+    prior["metadata"]["statuses"]["cpi_yoy"]["last_fetched"] = "2026-11-13T14:17:00"   # 7 PT days
+    refresh_v2.OUTPUT_PATH.write_text(json.dumps(prior), encoding="utf-8")
+    refresh_v2.run()
+    fetched = [kw["series_id"] for src, kw in env.calls if src == "fred"]
+    assert "CPIAUCSL" in fetched and "GDPX" not in fetched
+    assert _out()["metadata"]["statuses"]["cpi_yoy"]["last_attempt"] == NOW_TS
+
+
+def test_run_unparseable_stamp_does_not_crash(env):
+    prior = json.loads(json.dumps(PRIOR))
+    prior["metadata"]["statuses"]["sp500"]["last_fetched"] = "not-a-date"
+    prior["metadata"]["statuses"]["gdp_growth"]["last_fetched"] = "2026-99-99"
+    refresh_v2.OUTPUT_PATH.write_text(json.dumps(prior), encoding="utf-8")
+    refresh_v2.run()
+    fetched = [kw["series_id"] for src, kw in env.calls if src in ("yahoo", "fred")]
+    assert "^GSPC" in fetched and "GDPX" in fetched          # treated as never fetched (m12)
