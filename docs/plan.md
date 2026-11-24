@@ -203,3 +203,32 @@ Adjusted test items:
 - **6.2-8 (scheduled-failure notification):** the notification test is "Telegram message received" for a failure of a scheduled or Mac-triggered run (flag file `.github/fail-next-scheduled` as before, or a Mac-triggered run with `inject=bad_fred_key`), plus: the Mac trigger failure alert (run `mac/pec-trigger.sh` with a bad `GH` path) and a watchdog alert (run it before any refresh that day) are each received. `alert-test.yml` and `mac/install.sh --test` pass.
 - **6.2-9:** additionally confirm Mac launchd runs appear in the run history (`workflow_dispatch` events at ~13:20 and ~15:50 PT) and `~/Library/Logs/pec/trigger.log` shows them.
 - **UAT:** "failure notification received" now means a Telegram message.
+
+---
+
+## Amendment B (2026-11-23) — intraday cadence, release polling, multpl outage, forward EPS
+
+Owner requests (2026-11-23 18:22 PT) and answers (18:4x PT):
+
+1. **Intraday cadence.** Weekday runs at 06:45, 07:45, 08:45, 09:45, 10:45, 11:45, 12:45 PT (market hours), 13:20 PT (post-close final), 15:50 PT (retry); watchdog 16:30 PT. Mac launchd is the trigger; the two GitHub post-close crons stay as backup. Only series that move intraday are fetched during market hours.
+2. **Release polling.** Series that publish less than intraday are fetched only until the expected new observation arrives, then not again until the next one is due.
+3. **multpl valuation series:** once per day after the close (owner choice).
+4. **multpl failures — root cause (verified 2026-11-23):** `www.multpl.com` resolves to a single DigitalOcean IP `178.128.130.10`; TCP 80 and 443 are actively refused (RST in ~17 ms) from GitHub runners (Azure WestUS3, run 45312015589), and the owner's own browser on a residential connection also cannot connect. Other hosts work from the same runner. Conclusion: **multpl.com is down for everyone** (server not accepting connections at its DNS address), not rate limiting or cloud blocking. Window: last success 2026-11-23 06:57 PT (spike run), first refusal ≤ 17:31 PT. Handling: carry-forward + daily retry (item 3) already cover it; staleness is warn-only for these series. If the outage exceeds ~2 weeks, bring source alternatives to the owner (no source change without approval).
+
+### Refresh-frequency model (replaces `market_daily` / `daily_once` / old `monthly` / `quarterly` semantics)
+
+| `refresh_frequency` | Series | Fetch rule |
+|---|---|---|
+| `intraday` | all 14 Yahoo series | Trading day and market open (09:30–16:00 ET, early-close days 13:00 ET) → fetch every run. After the close → fetch once if not already fetched after today's close. Otherwise skip. |
+| `daily_release` | FRED daily (rates, TIPS, credit, Fed funds, FX, WTI) and `yield_curve` | Expected latest observation = the trading day `publish_lag_bd` trading days before the last completed trading day (FRED: `publish_lag_bd: 1` default; Treasury `yield_curve`: 0). Fetch on every run while the stored last observation is older than expected; skip once satisfied. |
+| `daily_after_close` | 5 multpl series | Fetch once per trading day, at the first run after the close; on failure retry on later runs that day. |
+| `monthly` | `cpi_yoy`, `nber_recession` | Expected period = the most recently **ended** calendar month (FRED dates periods by their first day). While the stored last observation is earlier than that period's start: fetch at most once per calendar day. Once present: skip until the next month ends. |
+| `quarterly` | `gdp_growth`, 3 delinquency series | Same as monthly with calendar quarters. |
+
+- Trading days use an NYSE holiday + early-close list for 2026–2027 (new module `market_calendar.py`); weekends/holidays → no intraday fetch; `last_completed_trading_day` skips holidays.
+- A failed fetch never counts as satisfied; rules re-evaluate next run.
+- Healthcheck thresholds unchanged (docs/spike.md).
+- Mac: owner re-runs `git pull && mac/install.sh` once to load the new times.
+
+### Forward EPS (research: docs/eps-sources.md)
+FactSet Earnings Insight (weekly PDF; `https://www.factset.com/earningsinsight` redirects to the latest) prints the forward 12-month P/E and the S&P 500 price; **NTM EPS = price ÷ forward P/E** (±~0.3 % from P/E rounding). Implied values: 2026-05-08 349.39, 07-17 371.12, 09-11 397.47, 10-09 406.56, **11-20 419.64**. The manual override (354.84, 2026-05-07) is stale and understates EPS by ~18 %. Automating this is a new data source → owner approval required before build (pending).
