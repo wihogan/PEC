@@ -488,8 +488,8 @@ valuation_inputs:
     series_id:  forward_eps_ntm
     label:      "S&P 500 NTM Forward Operating EPS"
     manual_override:
-      value:    354.84
-      effective_date: "2026-05-07"
+      value:    419.64
+      effective_date: "2026-11-20"
     notes: >
       NTM (next-twelve-months) consensus forward operating EPS for the S&P 500.
       Update manually each week after markets close Friday.
