@@ -45,9 +45,13 @@ Web: https://github.com/wihogan/PEC/actions/workflows/refresh.yml, Run workflow,
 
 Options: `force` re-fetches every series (use after a bad day). Leave `deploy` on, `state_ref` = `state`, `inject` = `none`. The other values are for testing only.
 
-## 4. Update forward EPS
+## 4. Forward EPS
 
-Same Run workflow screen. Fill `eps_value` (a number from 200 to 600) and `eps_date` (YYYY-MM-DD, not in the future). Both are required together. The run edits `config/series_v2.yaml` on main, then refreshes. Bad values make the run fail at the start with a clear message and change nothing. Check the DDM panel on the page afterwards.
+Automatic: every refresh run reads the latest FactSet Earnings Insight PDF (published weekly, Fridays) and computes forward EPS = S&P 500 closing price divided by the forward 12-month P/E (accurate to about 0.3 %). It fetches at most once per Pacific day. The month-end history on the page is updated automatically. When the value moves more than 3 % or the source switches, you get an informational Telegram message.
+
+Your manual entry wins when it is newer: FactSet is used only if its report date is later than the manual override's effective date. To enter a value yourself: Run workflow on the refresh screen, fill `eps_value` (a number from 200 to 600) and `eps_date` (YYYY-MM-DD, not in the future); both are required together. The run edits `config/series_v2.yaml` on main, then refreshes. Bad values make the run fail at the start with a clear message and change nothing. The override stays in force until the next FactSet report dated after `eps_date`.
+
+To force manual only (ignore FactSet): change `PEC_EPS_MODE` to `override` in `.github/workflows/refresh.yml` on main. If FactSet fails (page change, block), the run keeps the last FactSet value (or the override) and `health.json` warns when the date is more than 45 days old. Check the DDM panel on the page afterwards.
 
 ## 5. Reading health.json
 
@@ -55,7 +59,7 @@ Open https://wihogan.github.io/PEC/health.json . Key fields: `ok` (true/false), 
 
 ## 6. Where state lives
 
-Branch `state` on the repo holds one file, `data_v2.json`, replaced after each good run. Branch `state-test` is for testing. Run logs and health.json are also attached to each run for 7 days (run page, Artifacts). The page itself is never stored in git. The only secrets are `FRED_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (GitHub repo secrets) and the two Keychain items on the Mac.
+Branch `state` on the repo holds `data_v2.json` plus the forward-EPS cache files (`forward_eps_ntm_history.json`, `factset_eps_latest.json`), replaced after each good run. Branch `state-test` is for testing. Run logs and health.json are also attached to each run for 7 days (run page, Artifacts). The page itself is never stored in git. The only secrets are `FRED_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (GitHub repo secrets) and the two Keychain items on the Mac.
 
 ## 7. Mac jobs: install and uninstall
 
@@ -65,6 +69,6 @@ To check the Telegram path from GitHub: Actions, alert-test, Run workflow.
 ## 8. Rollback
 
 - Bad data published: the last good data is in `state`; re-run refresh with `force` after the source recovers. An earlier page cannot be re-deployed directly; instead revert the code commit on main (GitHub, Commits, Revert) and re-run refresh.
-- Bad EPS: run the EPS update again with the correct value.
+- Bad EPS: run the EPS update again with the correct value (a manual entry dated today or later beats FactSet until the next FactSet report), or set `PEC_EPS_MODE` to `override`.
 - Stop everything: `bash mac/uninstall.sh` and disable the workflow (Actions, refresh, three dots, Disable workflow). The old laptop process remains as documented in the migration handoff.
 - Broken `state`: delete the `state` branch on GitHub; the next run reseeds it from the saved baseline (it logs a loud warning).
