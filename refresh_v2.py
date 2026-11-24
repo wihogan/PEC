@@ -501,9 +501,10 @@ def _needs_refresh(
     ET; calendar logic (once-per-day throttle, ended month/quarter) uses
     Pacific time, the zone of last_fetched and of the CI runner (TZ=America/Los_Angeles).
 
-    A series whose last status is "error" is never satisfied: it is due on every
-    run of its attempt window (for monthly/quarterly this overrides the
-    once-per-day throttle, since a failed attempt does not update last_fetched).
+    A series whose last status is "error" is never satisfied. Intraday,
+    daily_after_close and daily_release series retry on every run; monthly and
+    quarterly series retry at most once per Pacific calendar day (the throttle
+    keys on the last successful fetch).
     """
     now = now or datetime.now(PT)
     now_et = now.astimezone(ET)
@@ -537,8 +538,7 @@ def _needs_refresh(
             today, 1 if frequency == "monthly" else 3
         ):
             return False  # expected period already present
-        if errored:
-            return True
+        # Errors are retried on the next calendar day: the once-per-day throttle governs.
         return last.astimezone(PT).date() < today  # at most once per calendar day
 
     return True  # unknown frequency — always fetch

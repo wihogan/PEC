@@ -322,15 +322,6 @@ def test_slow_error_from_earlier_day_is_due(tz, freq, last_obs):
 
 
 @pytest.mark.parametrize("freq, last_obs", [("monthly", D(2026, 9, 1)), ("quarterly", D(2026, 4, 1))])
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Spec deviation (Amendment B monthly/quarterly: 'fetch at most once per calendar day'): "
-        "refresh_v2._needs_refresh returns True for status=='error' before the once-per-day "
-        "throttle, so after a successful fetch earlier today (last_fetched today) a later failed "
-        "attempt makes the series due on every remaining run that day."
-    ),
-)
 def test_slow_error_after_fetch_today_respects_daily_throttle(tz, freq, last_obs):
     now = pt(2026, 11, 23, 13, 20)
     assert due(freq, pt(2026, 11, 23, 6, 45), now, status="error", last_obs=last_obs) is False
