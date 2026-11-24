@@ -5,7 +5,8 @@ the seed is a tmp copy (or a synthetic file written here). date.today() is froze
 by patching spglobal.date with a subclass.
 """
 import json
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
@@ -156,84 +157,135 @@ def test_malformed_history_json_treated_as_empty(seed):
 
 
 # ---------------------------------------------------------------------------
-# record_month_end (FactSet automation)
+# record_month_end (forward-EPS automation; m11 dating rules)
 # ---------------------------------------------------------------------------
 def _entries():
     return {e["date"]: e["value"] for e in _history()["entries"]}
 
 
-def test_record_month_end_bootstraps_from_seed_and_adds_month(seed):
+T = date(2026, 11, 23)   # "today" (PT) for these tests
+
+
+def test_record_month_end_bootstraps_from_seed_and_adds_in_progress_month(seed):
     assert not spglobal._HISTORY_JSON.exists()
-    assert spglobal.record_month_end(date(2026, 11, 20), 419.644) is True
-    assert _entries() == {"2026-08-31": 340.1, "2026-09-30": 345.5, "2026-10-30": 350.12, "2026-11-30": 419.64}
+    assert spglobal.record_month_end(date(2026, 11, 20), 419.644, today=T) is True
+    # ended month 2026-10 re-dated from the seed's 10-30 to its month-end; Nov dated as_of
+    assert _entries() == {"2026-08-31": 340.1, "2026-09-30": 345.5, "2026-10-31": 350.12, "2026-11-20": 419.64}
     assert seed.read_text(encoding="utf-8") == SEED_TEXT        # seed never rewritten
 
 
-def test_record_month_end_existing_month_keeps_date_updates_value(seed):
-    spglobal.record_month_end(date(2026, 11, 20), 419.64)
-    assert spglobal.record_month_end(date(2026, 11, 27), 421.5) is True
+def test_record_month_end_in_progress_month_never_in_future(seed):
+    spglobal.record_month_end(date(2026, 11, 30), 419.64, today=T)     # as_of later than today, same month
+    assert "2026-11-23" in _entries() and "2026-11-30" not in _entries()
+
+
+def test_record_month_end_existing_month_updates_value_keeps_date(seed):
+    spglobal.record_month_end(date(2026, 11, 20), 419.64, today=T)
+    assert spglobal.record_month_end(date(2026, 11, 27), 421.5, today=date(2026, 11, 27)) is True
     e = _entries()
-    assert e["2026-11-30"] == 421.5 and len(e) == 4
-    # an existing irregular date key (seed's 2026-10-30) is kept as-is
-    assert spglobal.record_month_end(date(2026, 10, 30), 351.0) is True
-    assert "2026-10-30" in _entries() and "2026-10-31" not in _entries()
+    assert e["2026-11-20"] == 421.5 and len(e) == 4             # date not advanced within the month
+
+
+def test_record_month_end_redates_after_month_end(seed):
+    spglobal.record_month_end(date(2026, 11, 20), 419.64, today=T)
+    # first call in December: November re-dated to its month-end, December dated today
+    assert spglobal.record_month_end(date(2026, 12, 3), 425.0, today=date(2026, 12, 3)) is True
+    e = _entries()
+    assert e["2026-11-30"] == 419.64 and "2026-11-20" not in e
+    assert e["2026-12-03"] == 425.0
+
+
+def test_record_month_end_not_redated_on_last_day_of_month(seed):
+    spglobal.record_month_end(date(2026, 11, 20), 419.64, today=T)
+    spglobal.record_month_end(date(2026, 11, 20), 419.64, today=date(2026, 11, 30))
+    assert "2026-11-20" in _entries()           # month ends at the end of the 30th, not before
 
 
 def test_record_month_end_same_value_is_noop(seed):
-    spglobal.record_month_end(date(2026, 11, 20), 419.64)
+    spglobal.record_month_end(date(2026, 11, 20), 419.64, today=T)
     before = spglobal._HISTORY_JSON.read_text(encoding="utf-8")
-    assert spglobal.record_month_end(date(2026, 11, 27), 419.6400001) is False
+    assert spglobal.record_month_end(date(2026, 11, 27), 419.6400001, today=date(2026, 11, 27)) is False
     assert spglobal._HISTORY_JSON.read_text(encoding="utf-8") == before
 
 
 @pytest.mark.parametrize(
-    "as_of, key",
-    [(date(2026, 10, 30), "2026-10-31"), (date(2027, 2, 26), "2027-02-28"), (date(2028, 2, 25), "2028-02-29")],
+    "as_of, today, key",
+    [
+        (date(2026, 10, 30), T, "2026-10-31"),                     # ended month -> calendar month-end
+        (date(2027, 2, 26), date(2027, 3, 1), "2027-02-28"),
+        (date(2028, 2, 25), date(2028, 3, 1), "2028-02-29"),
+        (date(2026, 11, 20), T, "2026-11-20"),                     # in progress -> as_of
+        (date(2026, 11, 30), date(2026, 11, 30), "2026-11-30"),    # last day, as_of == today
+    ],
 )
-def test_record_month_end_uses_calendar_month_end(as_of, key):
+def test_record_month_end_entry_date(as_of, today, key):
     spglobal._SEED_YAML.write_text("entries: []\n", encoding="utf-8")
-    spglobal.record_month_end(as_of, 400.0)
+    spglobal.record_month_end(as_of, 400.0, today=today)
     assert list(_entries()) == [key]
 
 
-def test_record_month_end_merges_new_seed_rows_on_value_change(seed):
-    spglobal._save_history_entries([{"date": "2026-08-31", "value": 340.1}, {"date": "2026-11-30", "value": 419.64}])
-    assert spglobal.record_month_end(date(2026, 11, 27), 421.0) is True
+def test_record_month_end_default_today_is_pacific(monkeypatch):
+    class FrozenDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 12, 1, 7, 30, tzinfo=ZoneInfo("UTC")).astimezone(tz)   # Nov 30 PT
+    monkeypatch.setattr(spglobal, "datetime", FrozenDT)
+    spglobal._SEED_YAML.write_text("entries: []\n", encoding="utf-8")
+    spglobal.record_month_end(date(2026, 11, 30), 400.0)
+    assert list(_entries()) == ["2026-11-30"]
+    spglobal.record_month_end(date(2026, 11, 20), 401.0)
+    assert _entries() == {"2026-11-30": 401.0}
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "spglobal.record_month_end: an as_of in a LATER month than today is matched under its own "
+        "month key but dated min(as_of, today), i.e. in the current month, so it creates a second "
+        "entry for the current month (reachable only with a future-dated as_of, e.g. a hand-edited "
+        "override effective_date)."
+    ),
+)
+def test_record_month_end_future_month_as_of_does_not_duplicate_current_month(seed):
+    spglobal.record_month_end(date(2026, 11, 20), 419.64, today=date(2026, 11, 30))
+    spglobal.record_month_end(date(2026, 12, 2), 425.0, today=date(2026, 11, 30))
+    months = [d[:7] for d in _entries()]
+    assert len(months) == len(set(months))
+
+
+def test_record_month_end_merges_new_seed_rows(seed):
+    spglobal._save_history_entries([{"date": "2026-08-31", "value": 340.1}, {"date": "2026-11-20", "value": 419.64}])
+    assert spglobal.record_month_end(date(2026, 11, 20), 419.64, today=T) is True    # value unchanged, merge saved (D3)
     e = _entries()
-    assert list(e) == ["2026-08-31", "2026-09-30", "2026-10-30", "2026-11-30"]   # sorted, seed rows merged
-    assert e["2026-11-30"] == 421.0
+    assert list(e) == ["2026-08-31", "2026-09-30", "2026-10-31", "2026-11-20"]
+    assert spglobal.record_month_end(date(2026, 11, 20), 419.64, today=T) is False   # now a no-op
 
 
 def test_record_month_end_cache_wins_over_seed_for_same_month(seed):
     spglobal._save_history_entries([{"date": "2026-09-30", "value": 999.0}])
-    spglobal.record_month_end(date(2026, 11, 20), 419.64)
+    spglobal.record_month_end(date(2026, 11, 20), 419.64, today=T)
     assert _entries()["2026-09-30"] == 999.0
 
 
-def test_record_month_end_persists_seed_merge_when_value_unchanged(seed):
-    spglobal._save_history_entries([{"date": "2026-11-30", "value": 419.64}])
-    spglobal.record_month_end(date(2026, 11, 27), 419.64)
-    assert "2026-09-30" in _entries()
-
-
 def test_record_month_end_visible_in_history_fetch(seed):
-    spglobal.record_month_end(date(2026, 11, 20), 419.64)
+    spglobal.record_month_end(date(2026, 11, 20), 419.64, today=T)
     df = spglobal.fetch("forward_eps_ntm", history=True)
-    assert df["date"].dt.strftime("%Y-%m-%d").tolist()[-1] == "2026-11-30"
+    assert df["date"].dt.strftime("%Y-%m-%d").tolist()[-1] == "2026-11-20"
     assert df["value"].iloc[-1] == 419.64
 
 
 def test_record_month_end_never_raises(seed):
-    assert spglobal.record_month_end(date(2026, 11, 20), "not-a-number") is False
-    assert spglobal.record_month_end(None, 419.64) is False
+    assert spglobal.record_month_end(date(2026, 11, 20), "not-a-number", today=T) is False
+    assert spglobal.record_month_end(None, 419.64, today=T) is False
 
 
 def test_record_month_end_with_real_seed_backfill():
     spglobal._SEED_YAML.write_text(REAL_SEED.read_text(encoding="utf-8"), encoding="utf-8")
-    spglobal.record_month_end(date(2026, 11, 20), 419.64)
+    spglobal.record_month_end(date(2026, 11, 20), 419.64, today=T)
     e = _entries()
     for d, v in BACKFILL.items():
         assert e[d] == v
-    assert e["2026-11-30"] == 419.64
-    seed_rows = spglobal._seed_history_from_yaml()
-    assert len(e) == len(seed_rows) + (0 if any(r["date"].startswith("2026-11") for r in seed_rows) else 1)
+    nov = [d for d in e if d.startswith("2026-11")]
+    assert len(nov) == 1 and e[nov[0]] == 419.64
+    months = [d[:7] for d in e]
+    assert len(months) == len(set(months))

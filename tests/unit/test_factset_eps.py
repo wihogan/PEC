@@ -7,7 +7,7 @@ the real pypdf; requests.get is replaced by a fake.
 import io
 import json
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -230,25 +230,51 @@ NOV20_LINES = [
 FINAL_URL = BASE + "EarningsInsight_112026A.pdf"
 
 
+class FakeResponse:
+    def __init__(self, body, status, ctype, url, length=None, stream_exc=None, chunk=64 * 1024):
+        self.status_code, self.url = status, url
+        self.headers = {"Content-Type": ctype}
+        if length is not None:
+            self.headers["Content-Length"] = str(length)
+        self._body, self._stream_exc, self._chunk = body, stream_exc, chunk
+        self.closed = False
+        self.read_bytes = 0
+
+    def iter_content(self, chunk_size=1):
+        for i in range(0, len(self._body), self._chunk):
+            if self._stream_exc and i > 0:
+                raise self._stream_exc
+            part = self._body[i:i + self._chunk]
+            self.read_bytes += len(part)
+            yield b""                    # keep-alive chunks are skipped
+            yield part
+
+    def close(self):
+        self.closed = True
+
+
 class FakeGet:
-    def __init__(self, body=None, status=200, ctype="application/pdf", url=FINAL_URL, exc=None):
+    def __init__(self, body=None, status=200, ctype="application/pdf", url=FINAL_URL, exc=None,
+                 length=None, stream_exc=None, chunk=64 * 1024):
         self.body = make_pdf(NOV20_LINES) if body is None else body
-        self.status, self.ctype, self.url, self.exc = status, ctype, url, exc
-        self.calls = []
+        self.kw = dict(status=status, ctype=ctype, url=url, length=length, stream_exc=stream_exc, chunk=chunk)
+        self.exc = exc
+        self.calls, self.responses = [], []
 
     def __call__(self, url, **kw):
         self.calls.append((url, kw))
         if self.exc:
             raise self.exc
-        return SimpleNamespace(status_code=self.status, headers={"Content-Type": self.ctype},
-                               content=self.body, url=self.url)
+        r = FakeResponse(self.body, **self.kw)
+        self.responses.append(r)
+        return r
 
 
 @pytest.fixture
 def pt_clock(freeze):
     def set_(y, mo, d, h=12, mi=0):
         freeze(datetime(y, mo, d, h, mi, tzinfo=PT), module=fe)
-    set_(2026, 11, 23, 13, 20)
+    set_(2026, 11, 23, 13, 20)   # Monday; report as_of 2026-11-20 (3 days old)
     return set_
 
 
@@ -257,6 +283,10 @@ def fake_get(monkeypatch):
     g = FakeGet()
     monkeypatch.setattr(fe.requests, "get", g)
     return g
+
+
+def _raw():
+    return json.loads(fe._FACTSET_CACHE.read_text()) if fe._FACTSET_CACHE.exists() else {}
 
 
 def test_extract_text_from_real_pdf():
@@ -274,33 +304,75 @@ def test_fetch_forward_eps_end_to_end(pt_clock, fake_get):
     out = fe.fetch_forward_eps(last_good=412.86, override=419.64)
     assert out == {"value": 419.64, "as_of": "2026-11-20", "source": "factset", "pe": 17.1,
                    "price": 7175.83, "url": FINAL_URL}
-    assert fake_get.calls[0][0] == "https://www.factset.com/earningsinsight"
-    assert fake_get.calls[0][1]["allow_redirects"] is True
-    cache = json.loads(fe._FACTSET_CACHE.read_text())
+    url, kw = fake_get.calls[0]
+    assert url == "https://www.factset.com/earningsinsight"
+    assert kw["allow_redirects"] is True and kw["stream"] is True
+    assert fake_get.responses[0].closed is True
+    cache = _raw()
     assert cache["fetched_pt_date"] == "2026-11-23" and cache["value"] == 419.64
+    assert cache["fetched_at"] == "2026-11-23T13:20:00-08:00"
+    assert cache["fail_days"] == 0 and cache["last_fail_date"] is None and cache["notified"] == {}
 
 
-def test_cache_reused_same_pt_day(pt_clock, fake_get):
+# ---------------------------------------------------------------------------
+# QA M5: cache reuse matrix (same PT day, fetched >= 13:00 PT, as_of < 6 days)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "fetch_at, later, expect_downloads",
+    [
+        ((2026, 11, 23, 13, 20), (2026, 11, 23, 15, 50), 1),   # fetched after 13:00, same day -> reuse
+        ((2026, 11, 23, 13, 0), (2026, 11, 23, 15, 50), 1),    # exactly 13:00 -> reuse
+        ((2026, 11, 23, 12, 59), (2026, 11, 23, 13, 20), 2),   # morning fetch -> re-check
+        ((2026, 11, 23, 6, 45), (2026, 11, 23, 7, 45), 2),
+        ((2026, 11, 23, 13, 20), (2026, 11, 24, 6, 45), 2),    # next PT day
+    ],
+)
+def test_cache_reuse_matrix(pt_clock, fake_get, fetch_at, later, expect_downloads):
+    pt_clock(*fetch_at)
     fe.fetch_forward_eps()
-    pt_clock(2026, 11, 23, 23, 59)
+    pt_clock(*later)
     out = fe.fetch_forward_eps()
-    assert len(fake_get.calls) == 1
+    assert len(fake_get.calls) == expect_downloads
     assert out["value"] == 419.64 and out["source"] == "factset" and out["url"] == FINAL_URL
 
 
-def test_cache_expires_next_pt_day(pt_clock, fake_get):
+@pytest.mark.parametrize("today, reused", [((2026, 11, 25), True), ((2026, 11, 26), False), ((2026, 11, 27), False)])
+def test_cache_not_reused_when_as_of_6_days_old(pt_clock, fake_get, today, reused):
+    """as_of 2026-11-20: 5 days old -> reusable; 6+ days -> re-check even after 13:00."""
+    pt_clock(*today, 13, 20)
     fe.fetch_forward_eps()
-    pt_clock(2026, 11, 24, 0, 1)
+    pt_clock(*today, 15, 50)
     fe.fetch_forward_eps()
-    assert len(fake_get.calls) == 2
+    assert len(fake_get.calls) == (1 if reused else 2)
 
 
 def test_cache_day_is_pacific_not_utc(freeze, fake_get):
-    freeze(datetime(2026, 11, 23, 23, 0, tzinfo=PT), module=fe)
+    freeze(datetime(2026, 11, 23, 14, 0, tzinfo=PT), module=fe)
     fe.fetch_forward_eps()
-    freeze(datetime(2026, 11, 24, 7, 30, tzinfo=ZoneInfo("UTC")), module=fe)   # still Nov 23 PT
+    freeze(datetime(2026, 11, 24, 7, 30, tzinfo=ZoneInfo("UTC")), module=fe)   # 23:30 PT Nov 23
     fe.fetch_forward_eps()
     assert len(fake_get.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "cached",
+    [
+        {"value": 419.64, "as_of": "2026-11-20", "fetched_pt_date": "2026-11-23"},                       # no fetched_at
+        {"value": 419.64, "as_of": "2026-11-20", "fetched_pt_date": "2026-11-23", "fetched_at": "x"},
+        {"value": 419.64, "as_of": "garbage", "fetched_pt_date": "2026-11-23", "fetched_at": "2026-11-23T14:00:00-08:00"},
+    ],
+)
+def test_cache_with_bad_stamps_not_reused(pt_clock, fake_get, cached):
+    fe._write_raw(cached)
+    fe.fetch_forward_eps()
+    assert len(fake_get.calls) == 1
+
+
+def test_cache_naive_fetched_at_read_as_pt(pt_clock, fake_get):
+    fe._write_raw({"value": 419.64, "as_of": "2026-11-20", "fetched_pt_date": "2026-11-23",
+                   "fetched_at": "2026-11-23T13:05:00", "source": "factset"})
+    assert fe.fetch_forward_eps()["value"] == 419.64
+    assert fake_get.calls == []
 
 
 def test_use_cache_false_always_downloads(pt_clock, fake_get):
@@ -310,16 +382,17 @@ def test_use_cache_false_always_downloads(pt_clock, fake_get):
 
 
 def test_cached_result_skips_jump_check(pt_clock, fake_get):
-    """Documented behaviour: a result cached today is returned as-is; the jump guard runs only on download."""
+    """Documented behaviour: a reusable cached result is returned as-is; the jump guard runs only on download."""
     fe.fetch_forward_eps()
     out = fe.fetch_forward_eps(last_good=300.0, override=None)
     assert out["value"] == 419.64
 
 
-def test_jump_rejection_raises_and_does_not_cache(pt_clock, fake_get):
+def test_jump_rejection_raises_and_counts_failure(pt_clock, fake_get):
     with pytest.raises(FetchError, match="big jump"):
         fe.fetch_forward_eps(last_good=354.84, override=354.84)
-    assert not fe._FACTSET_CACHE.exists()
+    assert fe._load_cache() is None
+    assert _raw() == {"fail_days": 1, "last_fail_date": "2026-11-23"}
 
 
 def test_malformed_cache_ignored(pt_clock, fake_get):
@@ -329,14 +402,16 @@ def test_malformed_cache_ignored(pt_clock, fake_get):
     assert len(fake_get.calls) == 1
 
 
-def test_stale_cache_from_previous_day_not_used_on_failure(pt_clock, monkeypatch):
-    """A cache from an earlier day is not a fallback: a failed download raises."""
+def test_stale_cache_not_used_on_failure(pt_clock, monkeypatch):
+    """A non-reusable cache is not a fallback: a failed download raises (refresh_v2 carries forward)."""
     monkeypatch.setattr(fe.requests, "get", FakeGet())
     fe.fetch_forward_eps()
     pt_clock(2026, 11, 24, 9, 0)
     monkeypatch.setattr(fe.requests, "get", FakeGet(exc=requests.ConnectionError("down")))
     with pytest.raises(FetchError, match="download failed"):
         fe.fetch_forward_eps()
+    raw = _raw()
+    assert raw["value"] == 419.64 and raw["fail_days"] == 1 and raw["last_fail_date"] == "2026-11-24"
 
 
 @pytest.mark.parametrize(
@@ -346,13 +421,16 @@ def test_stale_cache_from_previous_day_not_used_on_failure(pt_clock, monkeypatch
         ({"status": 404}, "HTTP 404"),
         ({"body": b"<!DOCTYPE html><html>", "ctype": "text/html"}, "did not return a PDF"),
         ({"ctype": "text/html; charset=utf-8"}, "unexpected content-type"),
+        ({"stream_exc": requests.ConnectionError("reset"), "chunk": 64}, "download failed: ConnectionError"),
     ],
 )
 def test_download_failures(pt_clock, monkeypatch, kwargs, match):
-    monkeypatch.setattr(fe.requests, "get", FakeGet(**kwargs))
+    g = FakeGet(**kwargs)
+    monkeypatch.setattr(fe.requests, "get", g)
     with pytest.raises(FetchError, match=match):
         fe.fetch_forward_eps()
-    assert not fe._FACTSET_CACHE.exists()
+    assert fe._load_cache() is None
+    assert all(r.closed for r in g.responses)          # response always closed
 
 
 def test_download_octet_stream_accepted(pt_clock, monkeypatch):
@@ -360,11 +438,21 @@ def test_download_octet_stream_accepted(pt_clock, monkeypatch):
     assert fe.fetch_forward_eps()["value"] == 419.64
 
 
-def test_download_size_cap(pt_clock, monkeypatch):
-    monkeypatch.setattr(fe.requests, "get", FakeGet())
+def test_download_size_cap_while_streaming(pt_clock, monkeypatch):
+    g = FakeGet(chunk=50)
+    monkeypatch.setattr(fe.requests, "get", g)
     monkeypatch.setattr(fe, "_MAX_PDF_BYTES", 100)
-    with pytest.raises(FetchError, match="unexpectedly large"):
+    with pytest.raises(FetchError, match=r"unexpectedly large \(over 100 bytes\)"):
         fe.fetch_forward_eps()
+    assert g.responses[0].read_bytes <= 150 and g.responses[0].closed     # stopped early
+
+
+def test_download_size_cap_from_content_length(pt_clock, monkeypatch):
+    g = FakeGet(length=10**9)
+    monkeypatch.setattr(fe.requests, "get", g)
+    with pytest.raises(FetchError, match="Content-Length 1000000000"):
+        fe.fetch_forward_eps()
+    assert g.responses[0].read_bytes == 0 and g.responses[0].closed
 
 
 def test_pdf_without_sentences_fails_closed(pt_clock, monkeypatch):
@@ -372,3 +460,134 @@ def test_pdf_without_sentences_fails_closed(pt_clock, monkeypatch):
                                                                    "Forward EPS $419.64"])))
     with pytest.raises(FetchError, match="P/E sentence not found"):
         fe.fetch_forward_eps()
+
+
+# ---------------------------------------------------------------------------
+# QA M5: failure markers and one-time notices
+# ---------------------------------------------------------------------------
+def _fail(pt_clock, monkeypatch, day, h=6, mi=45):
+    pt_clock(2026, 11, day, h, mi)
+    monkeypatch.setattr(fe.requests, "get", FakeGet(exc=requests.ConnectionError("down")))
+    with pytest.raises(FetchError):
+        fe.fetch_forward_eps()
+
+
+def test_failures_count_once_per_pt_day(pt_clock, monkeypatch):
+    for h in (6, 7, 8, 13):
+        _fail(pt_clock, monkeypatch, 23, h)
+    assert _raw()["fail_days"] == 1
+    _fail(pt_clock, monkeypatch, 24)
+    assert _raw()["fail_days"] == 2 and _raw()["last_fail_date"] == "2026-11-24"
+
+
+def test_success_resets_failure_streak_keeps_markers(pt_clock, monkeypatch):
+    _fail(pt_clock, monkeypatch, 23)
+    _fail(pt_clock, monkeypatch, 24)
+    fe._write_raw({**_raw(), "notified": {"failing": True}})
+    pt_clock(2026, 11, 25, 13, 20)
+    monkeypatch.setattr(fe.requests, "get", FakeGet())
+    fe.fetch_forward_eps()
+    raw = _raw()
+    assert raw["fail_days"] == 0 and raw["last_fail_date"] is None and raw["notified"] == {"failing": True}
+
+
+NOTICE_MARKER_DEFECT = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "factset_eps.pending_notice: `notified` aliases raw['notified'] and is mutated in place, so "
+        "`notified != raw['notified']` is always False when the cache already has a 'notified' dict "
+        "(every successful fetch writes one). Markers are then never written: the notice repeats on "
+        "every run and a cleared condition never re-arms."
+    ),
+)
+
+
+def test_notice_none_without_cache():
+    assert fe.pending_notice(date(2026, 11, 23)) is None
+
+
+def test_notice_after_two_failing_days_sent_once(pt_clock, monkeypatch):
+    _fail(pt_clock, monkeypatch, 23)
+    assert fe.pending_notice(date(2026, 11, 23)) is None                  # 1 failing day
+    _fail(pt_clock, monkeypatch, 24)
+    msg = fe.pending_notice(date(2026, 11, 24))
+    assert msg == ("\u2139\ufe0f PEC: FactSet forward EPS fetch has failed on 2 consecutive days. "
+                   "Check docs/runbook.md (EPS) or update the override.\n")
+    assert fe.pending_notice(date(2026, 11, 24)) is None                  # de-duplicated
+    _fail(pt_clock, monkeypatch, 25)
+    assert fe.pending_notice(date(2026, 11, 25)) is None                  # still the same condition
+    assert _raw()["notified"] == {"failing": True}
+
+
+@NOTICE_MARKER_DEFECT
+def test_notice_rearms_after_recovery(pt_clock, monkeypatch):
+    _fail(pt_clock, monkeypatch, 23)
+    _fail(pt_clock, monkeypatch, 24)
+    assert fe.pending_notice(date(2026, 11, 24)) is not None
+    pt_clock(2026, 11, 25, 13, 20)
+    monkeypatch.setattr(fe.requests, "get", FakeGet())
+    fe.fetch_forward_eps()
+    assert fe.pending_notice(date(2026, 11, 25)) is None
+    assert _raw()["notified"] == {}                                       # condition cleared -> re-armed
+    _fail(pt_clock, monkeypatch, 30)
+    pt_clock(2026, 12, 1, 6, 45)
+    monkeypatch.setattr(fe.requests, "get", FakeGet(exc=requests.ConnectionError("down")))
+    with pytest.raises(FetchError):
+        fe.fetch_forward_eps()
+    assert "failed on 2 consecutive days" in fe.pending_notice(date(2026, 12, 1))
+
+
+@pytest.mark.parametrize(
+    "today, expect",
+    [(date(2026, 11, 30), False), pytest.param(date(2026, 12, 1), True, marks=NOTICE_MARKER_DEFECT)],
+)
+def test_notice_stale_as_of_over_10_days(today, expect):
+    fe._write_raw({"value": 419.64, "as_of": "2026-11-20", "fail_days": 0, "notified": {}})
+    msg = fe.pending_notice(today)
+    if expect:
+        assert msg == ("\u2139\ufe0f PEC: FactSet forward EPS report is 11 days old (as of 2026-11-20). "
+                       "Check docs/runbook.md (EPS) or update the override.\n")
+        assert fe.pending_notice(today) is None                          # sent once
+        assert fe.pending_notice(today + timedelta(days=3)) is None
+    else:
+        assert msg is None
+
+
+@NOTICE_MARKER_DEFECT
+def test_notice_both_conditions_in_one_message():
+    fe._write_raw({"value": 419.64, "as_of": "2026-11-01", "fail_days": 3, "notified": {}})
+    msg = fe.pending_notice(date(2026, 11, 23))
+    assert msg.startswith("\u2139\ufe0f PEC: FactSet forward EPS fetch has failed on 3 consecutive days; "
+                          "FactSet forward EPS report is 22 days old (as of 2026-11-01).")
+    assert _raw()["notified"] == {"failing": True, "stale": True}
+
+
+def test_notice_one_condition_already_sent_other_new():
+    fe._write_raw({"value": 419.64, "as_of": "2026-11-01", "fail_days": 2, "notified": {"failing": True}})
+    msg = fe.pending_notice(date(2026, 11, 23))
+    assert "22 days old" in msg and "consecutive" not in msg
+
+
+@NOTICE_MARKER_DEFECT
+def test_notice_marker_persists_value_fields():
+    fe._write_raw({"value": 419.64, "as_of": "2026-11-01", "fail_days": 0, "notified": {}, "url": "u"})
+    fe.pending_notice(date(2026, 11, 23))
+    raw = _raw()
+    assert raw["value"] == 419.64 and raw["url"] == "u" and raw["notified"] == {"stale": True}
+
+
+def test_notice_message_when_cache_has_empty_notified_dict():
+    """The message itself is produced (only de-duplication is affected by the marker defect)."""
+    fe._write_raw({"value": 419.64, "as_of": "2026-11-01", "fail_days": 0, "notified": {}})
+    assert "22 days old" in fe.pending_notice(date(2026, 11, 23))
+
+
+@NOTICE_MARKER_DEFECT
+def test_notice_sent_once_after_success_then_two_failing_days(pt_clock, monkeypatch):
+    """Realistic sequence: a success (cache has notified={}), then failures on two PT days."""
+    monkeypatch.setattr(fe.requests, "get", FakeGet())
+    fe.fetch_forward_eps()
+    _fail(pt_clock, monkeypatch, 24)
+    _fail(pt_clock, monkeypatch, 25)
+    assert fe.pending_notice(date(2026, 11, 25)) is not None
+    assert fe.pending_notice(date(2026, 11, 25)) is None

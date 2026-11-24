@@ -30,16 +30,24 @@ def et(y, mo, d, h=0, mi=0, s=0):
     return datetime(y, mo, d, h, mi, s, tzinfo=ET)
 
 
-def st(fetched, status="ok", sid="x"):
-    """statuses dict as run() writes it: last_fetched = naive PT isoformat."""
-    entry = {"status": status, "last_fetched": fetched.astimezone(PT).replace(tzinfo=None).isoformat(timespec="seconds")}
+def stamp(t):
+    return t.astimezone(PT).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def st(fetched, status="ok", sid="x", attempt=None):
+    """statuses dict as run() writes it: stamps are naive PT isoformat.
+    attempt=None omits last_attempt (state written before the QA fixes)."""
+    entry = {"status": status, "last_fetched": stamp(fetched) if fetched is not None else None}
+    if attempt is not None:
+        entry["last_attempt"] = stamp(attempt)
     if status == "error":
         entry["error"] = "boom"
     return {sid: entry}
 
 
-def due(freq, fetched, now, status="ok", last_obs=None, lag=0):
-    return _needs_refresh("x", freq, st(fetched, status), last_obs=last_obs, publish_lag_bd=lag, now=now)
+def due(freq, fetched, now, status="ok", last_obs=None, lag=0, attempt=None, session=True):
+    return _needs_refresh("x", freq, st(fetched, status, attempt=attempt), last_obs=last_obs,
+                          publish_lag_bd=lag, now=now, session_series=session)
 
 
 D = date
@@ -265,8 +273,8 @@ def test_period_start(today, months, expected):
 @pytest.mark.parametrize(
     "fetched, now, last_obs, expected",
     [
-        # expected period (Oct 1) present -> skip regardless of last_fetched
-        (pt(2026, 11, 2, 6, 45), pt(2026, 11, 23, 13, 20), D(2026, 10, 1), False),
+        # expected period (Oct 1) present, last attempt < 7 PT days ago -> skip
+        (pt(2026, 11, 17, 6, 45), pt(2026, 11, 23, 13, 20), D(2026, 10, 1), False),
         # missing -> due, at most once per PT calendar day
         (pt(2026, 11, 22, 13, 20), pt(2026, 11, 23, 6, 45), D(2026, 9, 1), True),
         (pt(2026, 11, 23, 6, 45), pt(2026, 11, 23, 13, 20), D(2026, 9, 1), False),
@@ -291,7 +299,7 @@ def test_monthly(tz, fetched, now, last_obs, expected):
 @pytest.mark.parametrize(
     "fetched, now, last_obs, expected",
     [
-        (pt(2026, 11, 2, 6, 45), pt(2026, 11, 23, 13, 20), D(2026, 7, 1), False),    # Q3 present
+        (pt(2026, 11, 17, 6, 45), pt(2026, 11, 23, 13, 20), D(2026, 7, 1), False),   # Q3 present, 6 days
         (pt(2026, 11, 22, 6, 45), pt(2026, 11, 23, 13, 20), D(2026, 4, 1), True),    # Q3 missing
         (pt(2026, 11, 23, 6, 45), pt(2026, 11, 23, 13, 20), D(2026, 4, 1), False),   # throttled
         # quarter boundary: Sep 30 -> Q2 expected; Oct 1 -> Q3 expected
@@ -309,10 +317,170 @@ def test_quarterly(tz, fetched, now, last_obs, expected):
     assert due("quarterly", fetched, now, last_obs=last_obs) is expected
 
 
-@pytest.mark.parametrize("freq, last_obs", [("monthly", D(2026, 10, 1)), ("quarterly", D(2026, 7, 1))])
-def test_slow_error_with_expected_period_present_is_skipped(tz, freq, last_obs):
+PRESENT = [("monthly", D(2026, 10, 1)), ("quarterly", D(2026, 7, 1))]
+MISSING = [("monthly", D(2026, 9, 1)), ("quarterly", D(2026, 4, 1))]
+
+
+@pytest.mark.parametrize("freq, last_obs", PRESENT + MISSING)
+@pytest.mark.parametrize(
+    "attempt, expected",
+    [
+        (pt(2026, 11, 22, 13, 20), True),     # last attempt yesterday -> retry
+        (pt(2026, 11, 23, 0, 5), False),      # already attempted today (PT) -> throttled
+        (None, True),                          # old state without last_attempt (last success 11-02)
+    ],
+)
+def test_slow_error_retried_once_per_pt_day_even_if_period_present(tz, freq, last_obs, attempt, expected):
+    """QA M1: an errored slow series is never satisfied; throttled on last_attempt."""
     now = pt(2026, 11, 23, 13, 20)
-    assert due(freq, pt(2026, 11, 2), now, status="error", last_obs=last_obs) is False
+    assert due(freq, pt(2026, 11, 2), now, status="error", last_obs=last_obs, attempt=attempt) is expected
+
+
+@pytest.mark.parametrize("freq, last_obs", PRESENT)
+def test_slow_error_attempt_day_is_pacific(tz, freq, last_obs):
+    # attempt 23:30 PT Nov 22 (= 07:30 UTC Nov 23); now 00:30 PT Nov 23 -> new PT day -> due
+    assert due(freq, pt(2026, 11, 2), pt(2026, 11, 23, 0, 30), status="error", last_obs=last_obs,
+               attempt=pt(2026, 11, 22, 23, 30)) is True
+    # attempt 00:10 PT Nov 23; now 23:50 PT Nov 23 (= 07:50 UTC Nov 24) -> same PT day -> throttled
+    assert due(freq, pt(2026, 11, 2), datetime(2026, 11, 24, 7, 50, tzinfo=UTC), status="error",
+               last_obs=last_obs, attempt=pt(2026, 11, 23, 0, 10)) is False
+
+
+@pytest.mark.parametrize("freq", ["monthly", "quarterly"])
+def test_slow_error_never_succeeded(tz, freq):
+    """Errored with no successful fetch ever (last_fetched None) but attempted today -> throttled."""
+    now = pt(2026, 11, 23, 13, 20)
+    assert due(freq, None, now, status="error", attempt=pt(2026, 11, 23, 6, 45)) is False
+    assert due(freq, None, now, status="error", attempt=pt(2026, 11, 22, 6, 45)) is True
+
+
+# ---------------------------------------------------------------------------
+# Weekly revision re-check (owner decision 2026-11-24, QA m3)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("freq, last_obs", PRESENT)
+@pytest.mark.parametrize(
+    "attempt, now, expected",
+    [
+        (pt(2026, 11, 16, 23, 59), pt(2026, 11, 23, 0, 1), True),     # 7 PT days -> re-check
+        (pt(2026, 11, 17, 0, 1), pt(2026, 11, 23, 23, 59), False),    # 6 PT days -> skip
+        (pt(2026, 11, 16, 6, 45), pt(2026, 11, 23, 6, 45), True),
+        (pt(2026, 11, 23, 6, 45), pt(2026, 11, 23, 13, 20), False),
+        # 23:30 PT Nov 16 is Nov 17 in UTC; now 00:30 PT Nov 23: still 7 PT days
+        (pt(2026, 11, 16, 23, 30), pt(2026, 11, 23, 0, 30), True),
+        # now 23:00 PT Nov 22 (= 07:00 UTC Nov 23): 6 PT days -> skip
+        (pt(2026, 11, 16, 6, 45), datetime(2026, 11, 23, 7, 0, tzinfo=UTC), False),
+    ],
+)
+def test_weekly_revision_recheck(tz, freq, last_obs, attempt, now, expected):
+    # last_fetched far older; the weekly rule keys on last_attempt
+    assert due(freq, pt(2026, 10, 1), now, last_obs=last_obs, attempt=attempt) is expected
+
+
+@pytest.mark.parametrize("freq, last_obs", PRESENT)
+def test_weekly_revision_falls_back_to_last_fetched(tz, freq, last_obs):
+    now = pt(2026, 11, 23, 13, 20)
+    assert due(freq, pt(2026, 11, 16, 6, 0), now, last_obs=last_obs) is True    # 7 days
+    assert due(freq, pt(2026, 11, 17, 6, 0), now, last_obs=last_obs) is False   # 6 days
+
+
+@pytest.mark.parametrize("freq, last_obs", MISSING)
+def test_missing_period_throttle_uses_last_attempt(tz, freq, last_obs):
+    """Not yet satisfied (status ok): at most one attempt per PT day, keyed on last_attempt."""
+    now = pt(2026, 11, 23, 13, 20)
+    assert due(freq, pt(2026, 11, 1), now, last_obs=last_obs, attempt=pt(2026, 11, 23, 6, 45)) is False
+    assert due(freq, pt(2026, 11, 1), now, last_obs=last_obs, attempt=pt(2026, 11, 22, 6, 45)) is True
+
+
+# ---------------------------------------------------------------------------
+# m12: unparseable stamps count as never fetched
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("freq", ["intraday", "daily_release", "daily_after_close", "monthly", "quarterly"])
+@pytest.mark.parametrize("bad", ["garbage", "2026-13-45T00:00:00", 12345, "2026/11/23 13:20"])
+def test_unparseable_last_fetched_is_never_fetched(tz, freq, bad):
+    s = {"x": {"status": "ok", "last_fetched": bad}}
+    assert _needs_refresh("x", freq, s, last_obs=D(2026, 11, 23), now=pt(2026, 11, 23, 15, 50)) is True
+
+
+def test_unparseable_last_attempt_falls_back_to_last_fetched(tz):
+    now = pt(2026, 11, 23, 13, 20)
+    s = {"x": {"status": "ok", "last_fetched": stamp(pt(2026, 11, 20)), "last_attempt": "nope"}}
+    assert _needs_refresh("x", "monthly", s, last_obs=D(2026, 10, 1), now=now) is False   # 3 days
+    s = {"x": {"status": "error", "last_fetched": stamp(pt(2026, 11, 23, 6)), "last_attempt": "nope"}}
+    assert _needs_refresh("x", "monthly", s, last_obs=D(2026, 10, 1), now=now) is False   # today
+
+
+def test_naive_now_is_pacific(tz):
+    """A naive `now` override is read as Pacific time, not the process zone."""
+    s = st(pt(2026, 11, 23, 6, 45), attempt=pt(2026, 11, 23, 6, 45))
+    naive = datetime(2026, 11, 23, 23, 30)            # 23:30 PT = 07:30 UTC next day
+    assert _needs_refresh("x", "monthly", s, last_obs=D(2026, 9, 1), now=naive) is False
+
+
+# ---------------------------------------------------------------------------
+# QA M2: intraday after the close is satisfied by data for exchange-traded series
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "fetched, now, last_obs, expected",
+    [
+        # Mon 23 close 13:00 PT. Bar present -> satisfied even if fetched before close
+        (pt(2026, 11, 23, 12, 45), pt(2026, 11, 23, 13, 20), D(2026, 11, 23), False),
+        # fetched before close, bar missing -> due
+        (pt(2026, 11, 23, 12, 45), pt(2026, 11, 23, 13, 20), D(2026, 11, 20), True),
+        # fetched after close but bar missing -> keep trying until 18:00 PT
+        (pt(2026, 11, 23, 13, 20), pt(2026, 11, 23, 15, 50), D(2026, 11, 20), True),
+        (pt(2026, 11, 23, 13, 20), pt(2026, 11, 23, 17, 59), D(2026, 11, 20), True),
+        (pt(2026, 11, 23, 13, 20), pt(2026, 11, 23, 18, 0), D(2026, 11, 20), False),
+        (pt(2026, 11, 23, 13, 20), pt(2026, 11, 23, 23, 0), D(2026, 11, 20), False),
+        (pt(2026, 11, 23, 13, 20), pt(2026, 11, 24, 6, 0), D(2026, 11, 20), False),    # next day pre-open
+        # backup crons in UTC: 23:47 UTC = 15:47 PT -> still before 18:00 PT
+        (pt(2026, 11, 23, 13, 20), datetime(2026, 11, 23, 23, 47, tzinfo=UTC), D(2026, 11, 20), True),
+        # early close Fri 27 (10:00 PT): window runs to 18:00 PT
+        (pt(2026, 11, 27, 10, 45), pt(2026, 11, 27, 12, 45), D(2026, 11, 25), True),
+        (pt(2026, 11, 27, 10, 45), pt(2026, 11, 27, 12, 45), D(2026, 11, 27), False),
+        # weekend: Fri bar missing after a post-close fetch -> not re-fetched until open
+        (pt(2026, 11, 27, 10, 45), pt(2026, 11, 28, 12, 0), D(2026, 11, 25), False),
+        # Thanksgiving: lctd Wed 25
+        (pt(2026, 11, 25, 13, 20), pt(2026, 11, 26, 9, 45), D(2026, 11, 25), False),
+        (pt(2026, 11, 25, 12, 45), pt(2026, 11, 26, 9, 45), D(2026, 11, 25), False),   # bar present
+        # newer-than-expected obs (provisional bar) counts as present
+        (pt(2026, 11, 23, 13, 20), pt(2026, 11, 23, 15, 50), D(2026, 11, 24), False),
+    ],
+)
+def test_intraday_exchange_traded_data_rule(tz, fetched, now, last_obs, expected):
+    assert due("intraday", fetched, now, last_obs=last_obs) is expected
+
+
+@pytest.mark.parametrize(
+    "fetched, now, expected",
+    [
+        (pt(2026, 11, 23, 13, 20), pt(2026, 11, 23, 15, 50), False),   # fetch-time rule
+        (pt(2026, 11, 23, 12, 45), pt(2026, 11, 23, 15, 50), True),
+    ],
+)
+@pytest.mark.parametrize("last_obs", [None, D(2026, 11, 20)])
+def test_intraday_crypto_and_no_data_keep_fetch_time_rule(tz, fetched, now, expected, last_obs):
+    """Crypto (session_series=False) ignores last_obs; exchange-traded with last_obs None
+    falls back to the fetch-time rule too."""
+    assert due("intraday", fetched, now, last_obs=last_obs, session=False) is expected
+    if last_obs is None:
+        assert due("intraday", fetched, now, last_obs=None, session=True) is expected
+
+
+def test_intraday_open_session_always_due_regardless_of_data(tz):
+    now = pt(2026, 11, 23, 9, 45)
+    assert due("intraday", now, now, last_obs=D(2026, 11, 23)) is True
+    assert due("intraday", now, now, last_obs=D(2026, 11, 23), session=False) is True
+
+
+def test_daily_after_close_ignores_last_obs(tz):
+    """multpl keeps the fetch-time rule (row dates irregular)."""
+    assert due("daily_after_close", pt(2026, 11, 23, 13, 20), pt(2026, 11, 23, 15, 50),
+               last_obs=D(2026, 10, 30)) is False
+
+
+def test_continuous_series_constant():
+    assert refresh_v2.CONTINUOUS_SERIES == {"btc_usd", "eth_usd", "xrp_usd"}
+    assert refresh_v2.REFETCH_CUTOFF_PT.isoformat() == "18:00:00"
 
 
 @pytest.mark.parametrize("freq, last_obs", [("monthly", D(2026, 9, 1)), ("quarterly", D(2026, 4, 1))])

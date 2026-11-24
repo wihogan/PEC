@@ -126,8 +126,11 @@ def set_status(d, sid, status, attempted=True):
     if status == "error":
         st["error"] = f"{sid} boom"
         st["last_fetched"] = "2026-11-19T14:17:00"
+        # QA M1: run() stamps every attempt; a carried-forward error keeps an older stamp
+        st["last_attempt"] = lr if attempted else "2026-11-19T14:17:00"
     else:
         st["last_fetched"] = lr if attempted else "2026-11-02T06:40:35"
+        st["last_attempt"] = st["last_fetched"]
     d["metadata"]["statuses"][sid] = st
 
 
@@ -661,3 +664,72 @@ def test_rule6_factset_age_warning_uses_as_of(mutated):
     if old > OV_DATE:
         r = check(mutated(_factset(old.isoformat())))
         assert any("46 days old" in w for w in r["warnings"])
+
+
+
+# ---------------------------------------------------------------------------
+# QA M1: attempted() keys on last_attempt (fallback last_fetched)
+# ---------------------------------------------------------------------------
+def test_rule4_carried_forward_slow_errors_do_not_count(mutated):
+    """QA M1 reproduction: 3 slow FRED series stuck in error from an earlier run, and a run
+    that fetched only other series -> rule 4 must not fire."""
+    def fn(d):
+        _only_attempted(d, "fred", [])
+        for sid in FRED_SLOW:
+            set_status(d, sid, "error", attempted=False)
+    r = check(mutated(fn))
+    assert r["failures"] == []
+    assert sum(w.endswith("boom") for w in r["warnings"]) == 3      # still warned
+
+
+def _old_state(d, sid, status, stamp):
+    """Status record written before the QA fixes: no last_attempt."""
+    st = {"status": status, "last_fetched": stamp}
+    if status == "error":
+        st["error"] = f"{sid} boom"
+    d["metadata"]["statuses"][sid] = st
+
+
+def test_rule4_old_state_without_last_attempt_ok_counts_via_last_fetched(mutated):
+    def fn(d):
+        _only_attempted(d, "fred", FRED_SLOW)
+        _old_state(d, "fed_funds", "ok", d["metadata"]["last_refreshed"])   # attempted via last_fetched
+    assert check(mutated(fn))["failures"] == []
+
+
+def test_rule4_old_state_errors_without_last_attempt_not_counted(mutated):
+    """Old-state compatibility: an error record without last_attempt carries the last success
+    stamp, which is not this run, so it is not counted as attempted."""
+    def fn(d):
+        _only_attempted(d, "fred", [])
+        for sid in FRED_SLOW:
+            _old_state(d, sid, "error", "2026-11-02T06:40:35")
+    assert check(mutated(fn))["failures"] == []
+
+
+def test_rule4_last_attempt_wins_over_last_fetched(mutated):
+    def fn(d):
+        lr = d["metadata"]["last_refreshed"]
+        _only_attempted(d, "fred", FRED_SLOW)
+        # last_fetched equals last_refreshed but last_attempt is older -> not attempted
+        d["metadata"]["statuses"]["fed_funds"] = {"status": "ok", "last_fetched": lr, "last_attempt": "2026-11-01T00:00:00"}
+    assert rules(check(mutated(fn))) == ["rule 4"]
+
+
+def test_rule4_no_last_refreshed_nothing_attempted(mutated):
+    def fn(d):
+        for sid in MD_MIXED:
+            set_status(d, sid, "error")
+        d["metadata"]["last_refreshed"] = None
+    assert "rule 4" not in rules(check(mutated(fn)))
+
+
+# ---------------------------------------------------------------------------
+# m5: calendar-end warning
+# ---------------------------------------------------------------------------
+def test_calendar_end_warning(pass_files):
+    end = date(max(__import__("market_calendar").CALENDAR_YEARS), 12, 31)
+    r = check(pass_files, now=datetime.combine(end - timedelta(days=61), datetime.min.time()).astimezone())
+    assert not [w for w in r["warnings"] if w.startswith("market_calendar")]
+    r = check(pass_files, now=datetime.combine(end - timedelta(days=60), datetime.min.time()).astimezone())
+    assert f"market_calendar covers NYSE holidays only to {end.isoformat()} (60 days left); add the next year to market_calendar.py" in r["warnings"]
