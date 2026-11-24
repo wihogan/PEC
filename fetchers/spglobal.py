@@ -265,6 +265,49 @@ def _ensure_history(current_value: float) -> None:
         )
 
 
+def record_month_end(as_of: date, value: float) -> bool:
+    """
+    Upsert the month-end history entry for as_of's month (FactSet automation).
+
+    - Entry date is the CALENDAR month-end (matches config/forward_eps_seed.yaml
+      convention, e.g. 2026-10-31). An existing entry for that year-month keeps its
+      own date key and only has its value replaced (latest report of the month wins).
+    - Seed entries for months missing from the cache are merged in first, so adding
+      backfill rows to the seed also reaches an existing cache.
+    - Only the history cache is written (persisted on the state branch by
+      tools/state.sh). The seed file is NOT rewritten: write-back strips its comments
+      and the CI runner discards it anyway.
+    Returns True if the history cache was modified. Never raises.
+    """
+    try:
+        entries = _load_history_entries()
+        have = {str(e["date"])[:7] for e in entries}
+        for e in _seed_history_from_yaml():
+            if e["date"][:7] not in have:
+                entries.append(e)
+                have.add(e["date"][:7])
+        key = f"{as_of.year}-{as_of.month:02d}"
+        val = round(float(value), 2)
+        modified = False
+        for e in entries:
+            if str(e["date"])[:7] == key:
+                if abs(float(e["value"]) - val) > 1e-9:
+                    e["value"] = val
+                    modified = True
+                break
+        else:
+            last_day = calendar.monthrange(as_of.year, as_of.month)[1]
+            entries.append({"date": date(as_of.year, as_of.month, last_day).isoformat(), "value": val})
+            modified = True
+        entries.sort(key=lambda e: str(e["date"]))
+        if modified or not _HISTORY_JSON.exists():
+            _save_history_entries(entries)
+        return modified
+    except Exception as exc:
+        log.warning("[spglobal] record_month_end failed: %s", exc)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Point-in-time cache helpers (existing from Stage 3)
 # ---------------------------------------------------------------------------
@@ -541,7 +584,7 @@ def fetch(series_id: str, **kwargs) -> pd.DataFrame:
     Fallback chain (point-in-time)
     --------------
     1. S&P Global EPS xlsx (live download, 7-day cache).
-    2. FactSet Earnings Insight PDF / Yardeni chart page (factset_eps.py).
+    2. FactSet Earnings Insight PDF (factset_eps.py).
     3. .cache/forward_eps_ntm.json (last successful parse of any source).
     4. FetchError → triggers manual_override in refresh.py orchestrator.
 
@@ -595,15 +638,15 @@ def fetch(series_id: str, **kwargs) -> pd.DataFrame:
 
     except FetchError as exc:
         live_error_msg = str(exc)
-        log.warning("[spglobal] Live parse failed (%s) — trying FactSet/Yardeni", exc)
+        log.warning("[spglobal] Live parse failed (%s) — trying FactSet", exc)
     except Exception as exc:
         live_error_msg = str(exc)
         log.warning(
-            "[spglobal] Live parse raised unexpectedly (%s) — trying FactSet/Yardeni", exc
+            "[spglobal] Live parse raised unexpectedly (%s) — trying FactSet", exc
         )
 
     # ----------------------------------------------------------------
-    # Path 2: FactSet PDF / Yardeni page (factset_eps.py)
+    # Path 2: FactSet Earnings Insight PDF (factset_eps.py)
     # ----------------------------------------------------------------
     if value is None:
         try:
@@ -614,11 +657,11 @@ def fetch(series_id: str, **kwargs) -> pd.DataFrame:
                 as_of_str = result.get("as_of", date.today().isoformat())
                 effective_date = date.fromisoformat(as_of_str)
                 log.info(
-                    "[spglobal] FactSet/Yardeni: NTM EPS = $%.2f  source=%s  as_of=%s",
+                    "[spglobal] FactSet: NTM EPS = $%.2f  source=%s  as_of=%s",
                     value, result.get("source", "?"), as_of_str,
                 )
         except Exception as exc:
-            log.warning("[spglobal] FactSet/Yardeni fetch failed: %s", exc)
+            log.warning("[spglobal] FactSet fetch failed: %s", exc)
 
     # ----------------------------------------------------------------
     # Path 3: JSON cache (last successful parse of any upstream source)

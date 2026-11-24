@@ -116,7 +116,7 @@ def _load_fetchers() -> dict:
     if str(HERE) not in sys.path:
         sys.path.insert(0, str(HERE))
 
-    from fetchers import fred, yahoo, treasury, shiller, spglobal, multpl  # noqa: PLC0415
+    from fetchers import fred, yahoo, treasury, shiller, spglobal, multpl, factset_eps  # noqa: PLC0415
 
     return {
         "fred":     fred,
@@ -125,6 +125,7 @@ def _load_fetchers() -> dict:
         "shiller":  shiller,
         "spglobal": spglobal,
         "multpl":   multpl,
+        "factset_eps": factset_eps,
     }
 
 
@@ -260,10 +261,66 @@ def _fetch_yield_curve(entry: dict, fetchers: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Valuation inputs fetch logic
 # ---------------------------------------------------------------------------
+def _eps_mode() -> str:
+    """
+    Resolve the forward-EPS mode: 'override' | 'factset' | '' (legacy live ladder).
+
+    PEC_EPS_MODE wins. An unrecognised PEC_EPS_MODE fails safe to 'override'.
+    PEC_EPS_OVERRIDE_ONLY=1 (backward compatible) means 'override'.
+    """
+    raw = os.environ.get("PEC_EPS_MODE", "").strip().lower()
+    if raw in ("override", "factset"):
+        return raw
+    if raw:
+        log.warning("PEC_EPS_MODE=%r not recognised (override|factset) — using 'override'", raw)
+        return "override"
+    if os.environ.get("PEC_EPS_OVERRIDE_ONLY") == "1":
+        return "override"
+    return ""
+
+
+def _parse_iso_date(v) -> Optional[date]:
+    try:
+        return date.fromisoformat(str(v)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+EPS_CHANGE_FLAG = HERE / "eps_change.txt"
+EPS_CHANGE_THRESHOLD = 0.03
+
+
+def _write_eps_change_flag(prev: Optional[dict], new: Optional[dict]) -> None:
+    """
+    Write eps_change.txt (read by the refresh workflow's Telegram step) when the forward
+    EPS source switched or the value moved more than 3 percent vs the previous state.
+    Removes any stale flag first. Never raises.
+    """
+    try:
+        EPS_CHANGE_FLAG.unlink(missing_ok=True)
+        if not new or new.get("value") is None or not prev or prev.get("value") is None:
+            return
+        old_v, new_v = float(prev["value"]), float(new["value"])
+        switched = prev.get("source") != new.get("source")
+        moved = old_v > 0 and abs(new_v - old_v) / old_v > EPS_CHANGE_THRESHOLD
+        if not (switched or moved):
+            return
+        label = {"factset": "FactSet", "override": "manual override"}.get(new.get("source"), str(new.get("source")))
+        as_of = new.get("as_of") or new.get("effective_date")
+        EPS_CHANGE_FLAG.write_text(
+            f"\u2139\ufe0f PEC forward EPS updated: {old_v:.2f} \u2192 {new_v:.2f} ({label}, as of {as_of})\n",
+            encoding="utf-8",
+        )
+        log.info("EPS change flag written: %.2f -> %.2f (%s)", old_v, new_v, label)
+    except Exception as exc:  # pragma: no cover
+        log.warning("Could not write EPS change flag: %s", exc)
+
+
 def _fetch_valuation_inputs(
     vi_config: dict,
     fetchers:  dict,
     statuses:  dict,
+    previous:  Optional[dict] = None,
 ) -> dict:
     """
     Process all entries under config['valuation_inputs'].
@@ -274,9 +331,17 @@ def _fetch_valuation_inputs(
         3. 'unavailable' record (never crashes the refresh)
 
     The 'source' field in each output record is the contract Stage 4 reads:
-        'live'        — fetched from the live source
+        'live'        — fetched from the live source (legacy mode, no PEC_EPS_MODE)
+        'factset'     — FactSet Earnings Insight (PEC_EPS_MODE=factset), used only when
+                        its as_of date is NEWER than the manual_override effective_date
         'override'    — used the manual_override from series.yaml
         'unavailable' — neither source produced a value
+
+    PEC_EPS_MODE=override  -> manual_override only.
+    PEC_EPS_MODE=factset   -> FactSet when newer than the override; otherwise (or on
+                              failure) the previous state's FactSet value if it is
+                              still newer than the override, else the override.
+    PEC_EPS_OVERRIDE_ONLY=1 is kept as an alias of PEC_EPS_MODE=override.
 
     Parameters
     ----------
@@ -302,6 +367,8 @@ def _fetch_valuation_inputs(
         value:          Optional[float] = None
         effective_date: Optional[str]   = None
         source:         str             = "unavailable"
+        extras:         dict            = {}
+        mode:           str             = _eps_mode() if vi_id == "forward_eps_ntm" else ""
 
         # ----------------------------------------------------------------
         # Attempt 1: live fetcher
@@ -315,11 +382,46 @@ def _fetch_valuation_inputs(
                 f"Add it to _load_fetchers() in refresh.py."
             )
             log.warning("[%s] %s", vi_id, live_error)
-        elif os.environ.get("PEC_EPS_OVERRIDE_ONLY") == "1":
-            log.info(
-                "[%s] PEC_EPS_OVERRIDE_ONLY=1 — skipping live fetch, using manual_override",
-                vi_id,
-            )
+        elif mode == "override":
+            log.info("[%s] PEC_EPS_MODE=override — skipping live fetch, using manual_override", vi_id)
+        elif mode == "factset":
+            fs_mod = fetchers.get("factset_eps")
+            ov = vi_entry.get("manual_override") or {}
+            ov_value = _safe_float(ov.get("value")) if ov.get("value") is not None else None
+            ov_date  = _parse_iso_date(ov.get("effective_date"))
+            prev_rec = (previous or {}).get(vi_id) or {}
+            prev_value = _safe_float(prev_rec.get("value")) if prev_rec.get("value") is not None else None
+            fs = None
+            try:
+                if fs_mod is None:
+                    raise ValueError("factset_eps fetcher not registered")
+                fs = fs_mod.fetch_forward_eps(
+                    last_good=prev_value if prev_value else ov_value,
+                    override=ov_value,
+                )
+            except Exception as exc:
+                live_error = exc
+                log.warning("[%s] FactSet fetch failed: %s", vi_id, exc)
+            if fs is not None:
+                fs_date = _parse_iso_date(fs.get("as_of"))
+                if fs_date is not None and (ov_date is None or fs_date > ov_date):
+                    value, effective_date, source = _safe_float(fs["value"]), fs_date.isoformat(), "factset"
+                    extras = {"as_of": effective_date, "url": fs.get("url")}
+                    log.info("[%s] Using FactSet — value=%s as_of=%s (override %s dated %s)",
+                             vi_id, value, effective_date, ov_value, ov_date)
+                    sp_mod = fetchers.get("spglobal")
+                    if sp_mod is not None and hasattr(sp_mod, "record_month_end"):
+                        sp_mod.record_month_end(fs_date, value)
+                else:
+                    log.info("[%s] FactSet as_of %s is not newer than override %s — override wins",
+                             vi_id, fs.get("as_of"), ov_date)
+            elif (prev_rec.get("source") == "factset" and prev_value is not None
+                  and _parse_iso_date(prev_rec.get("as_of")) is not None
+                  and (ov_date is None or _parse_iso_date(prev_rec.get("as_of")) > ov_date)):
+                value, effective_date, source = prev_value, str(prev_rec.get("as_of")), "factset"
+                extras = {"as_of": effective_date, "url": prev_rec.get("url")}
+                log.warning("[%s] FactSet unavailable — carrying forward previous FactSet value %s (as of %s)",
+                            vi_id, value, effective_date)
         else:
             try:
                 df             = fetcher_module.fetch(series_id)
@@ -340,7 +442,7 @@ def _fetch_valuation_inputs(
         # ----------------------------------------------------------------
         # Attempt 2: manual override
         # ----------------------------------------------------------------
-        if source != "live":
+        if source not in ("live", "factset"):
             override = vi_entry.get("manual_override") or {}
             ov_value = override.get("value")
             ov_date  = override.get("effective_date")
@@ -349,6 +451,8 @@ def _fetch_valuation_inputs(
                 value          = _safe_float(ov_value)
                 effective_date = str(ov_date)
                 source         = "override"
+                if mode:
+                    extras = {"as_of": effective_date, "url": None}
                 log.info(
                     "[%s] Using manual_override — value=%s, effective_date=%s",
                     vi_id, value, effective_date,
@@ -395,6 +499,7 @@ def _fetch_valuation_inputs(
             "effective_date": effective_date,
             "source":         source,
             "history":        history_block,
+            **extras,
         }
 
         if source == "unavailable":
@@ -851,7 +956,9 @@ def run(filter_ids: Optional[list] = None, force: bool = False) -> None:
     if vi_config:
         log.info("Processing %d valuation input(s)...", len(vi_config))
         try:
-            vi_out = _fetch_valuation_inputs(vi_config, fetchers, statuses)
+            prev_vi = existing.get("valuation_inputs") or {}
+            vi_out = _fetch_valuation_inputs(vi_config, fetchers, statuses, previous=prev_vi)
+            _write_eps_change_flag(prev_vi.get("forward_eps_ntm"), vi_out.get("forward_eps_ntm"))
         except Exception as exc:
             log.error(
                 "Valuation inputs processing raised unexpectedly: %s — "

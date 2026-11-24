@@ -41,7 +41,7 @@ on:
 
 env:
   TZ: America/Los_Angeles
-  PEC_EPS_OVERRIDE_ONLY: '1'
+  PEC_EPS_MODE: factset
 
 jobs:
   refresh:
@@ -207,6 +207,19 @@ jobs:
           args=()
           if [ "$FORCE" = "true" ]; then args+=(--force); fi
           python refresh_v2.py "${args[@]}" 2>&1 | tee refresh.log
+
+      - name: Notify forward EPS change
+        if: steps.norm.outputs.state_ref == 'state'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -uo pipefail
+          if [ -f eps_change.txt ]; then
+            tools/notify_telegram.sh eps_change.txt || echo "::warning::EPS change notification failed"
+          else
+            echo "no forward EPS change to report"
+          fi
 
       - name: Healthcheck
         run: |

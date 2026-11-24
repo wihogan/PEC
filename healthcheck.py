@@ -19,7 +19,8 @@ Hard-fail rules:
      > 3 failed intraday/daily_release series (reported as "market_daily"); all attempted FRED failed (>= 3 attempted);
      all attempted Yahoo failed (>= 3 attempted). Treasury / multpl: staleness only.
   5. Staleness of daily series (calendar days since last non-null observation).
-  6. valuation_inputs.forward_eps_ntm is the approved override from the config.
+  6. valuation_inputs.forward_eps_ntm is the config override (source override), or a FactSet
+     value (source factset) dated after the override's effective_date and within 200-600.
 
 Pure stdlib + PyYAML.
 """
@@ -282,21 +283,39 @@ def run_checks(data_path: Path, html_path: Path, config_path: Path, now: datetim
 
         # Rule 6 + EPS age warning
         eps = (data.get("valuation_inputs") or {}).get(EPS_VI_ID) or {}
-        if eps.get("source") != "override":
-            failures.append(
-                f"rule 6: {EPS_VI_ID} source is {eps.get('source')!r}, expected 'override'"
-            )
-        else:
+        eps_src = eps.get("source")
+        ok6 = False
+        if eps_src == "override":
             try:
-                same = abs(float(eps.get("value")) - float(cfg_eps.get("value"))) <= 1e-9
+                ok6 = abs(float(eps.get("value")) - float(cfg_eps.get("value"))) <= 1e-9
             except (TypeError, ValueError):
-                same = False
-            if not same:
+                ok6 = False
+            if not ok6:
                 failures.append(
                     f"rule 6: {EPS_VI_ID} value {eps.get('value')!r} does not match "
                     f"config override {cfg_eps.get('value')!r}"
                 )
-        eff = _to_date(eps.get("effective_date"))
+        elif eps_src == "factset":
+            as_of = _to_date(eps.get("as_of") or eps.get("effective_date"))
+            ov_date = _to_date(cfg_eps.get("effective_date"))
+            try:
+                in_range = 200.0 <= float(eps.get("value")) <= 600.0
+            except (TypeError, ValueError):
+                in_range = False
+            if as_of is None or (ov_date is not None and as_of <= ov_date):
+                failures.append(
+                    f"rule 6: {EPS_VI_ID} source is 'factset' but as_of {as_of} is not newer "
+                    f"than config override effective_date {ov_date}"
+                )
+            elif not in_range:
+                failures.append(
+                    f"rule 6: {EPS_VI_ID} factset value {eps.get('value')!r} outside 200-600"
+                )
+        else:
+            failures.append(
+                f"rule 6: {EPS_VI_ID} source is {eps_src!r}, expected 'override' or 'factset'"
+            )
+        eff = _to_date(eps.get("as_of") or eps.get("effective_date"))
         if eff is not None:
             eps_age = (today - eff).days
             if eps_age > THRESHOLDS["warn_eps_effective_days"]:

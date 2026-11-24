@@ -23,9 +23,9 @@
 #   Yardeni Forward EPS      Apr 23 2026 = $344.30
 #   Yardeni 52-Wk Fwd EPS   Apr 30 2026 = $346.19
 #
-# Current live override (as of 2026-04-30): $346.19
-# Source: Yardeni Research 52-Week Forward EPS, published Apr 30 2026.
-# Update weekly by checking yardeni.com or FactSet Earnings Insight PDF.
+# Current live override (as of 2026-11-20): $419.64
+# Source: FactSet Earnings Insight, price / forward 12M P/E (docs/eps-backfill.md).
+# From 2026-11 the refresh workflow fills new months automatically from FactSet.
 #
 # Format: date is last business/calendar day of month (YYYY-MM-DD), value is $.
 
@@ -108,3 +108,12 @@ entries:
   - {date: "2026-02-28", value: 326.00}
   - {date: "2026-03-31", value: 331.34}
   - {date: "2026-04-30", value: 345.14}  # Yardeni anchor Apr 30 = $346.19; FactSet-consistent
+
+  # 2026 May-Oct: FactSet Earnings Insight, price ÷ forward 12M P/E; see docs/eps-backfill.md
+  # (last weekly issue on/before month-end; provider switch from Yardeni/LSEG at May 2026)
+  - {date: "2026-05-31", value: 356.78}  # FactSet 2026-05-29: 7563.63 / 21.2
+  - {date: "2026-06-30", value: 366.04}  # FactSet 2026-06-26: 7357.49 / 20.1
+  - {date: "2026-07-31", value: 379.47}  # FactSet 2026-07-31: 7437.63 / 19.6
+  - {date: "2026-08-31", value: 394.44}  # FactSet 2026-08-28: 7730.99 / 19.6
+  - {date: "2026-09-30", value: 401.26}  # FactSet 2026-09-25: 7704.13 / 19.2
+  - {date: "2026-10-31", value: 412.86}  # FactSet 2026-10-30: 7720.39 / 18.7

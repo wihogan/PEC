@@ -1,0 +1,38 @@
+name: diag-factset
+# Temporary smoke test of fetchers/factset_eps.py from a GitHub runner (remove after verification).
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -q -r requirements.txt
+      - name: Fetch forward EPS from FactSet
+        run: |
+          python - <<'PY'
+          import json, logging, re
+          logging.basicConfig(level=logging.INFO)
+          from fetchers import factset_eps as f
+          try:
+              print("RESULT", json.dumps(f.fetch_forward_eps(use_cache=False)))
+          except Exception as exc:
+              print("FETCH FAILED:", repr(exc))
+              try:
+                  body, url = f._download_latest()
+                  text = f._extract_text(body)
+                  print("url", url, "bytes", len(body), "chars", len(text))
+                  for kw in ("P/E", "closing price", "target price"):
+                      for m in list(re.finditer(kw, text))[:3]:
+                          print("CTX", kw, "|", text[max(0, m.start() - 120): m.end() + 120])
+              except Exception as exc2:
+                  print("DIAG FAILED:", repr(exc2))
+              raise SystemExit(1)
+          PY

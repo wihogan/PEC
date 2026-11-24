@@ -1,35 +1,27 @@
 """
-fetchers/factset_eps.py — FactSet Earnings Insight forward EPS fetcher.
+fetchers/factset_eps.py - S&P 500 forward 12-month (NTM) EPS from FactSet Earnings Insight.
 
-Fetches the S&P 500 NTM forward operating EPS from the publicly available
-FactSet Earnings Insight PDF (no authentication required).
+Design (docs/eps-sources.md, "Key finding" and "(1) Primary"):
+    The weekly FactSet Earnings Insight PDF does NOT print the forward EPS dollar
+    figure in its text layer. It prints, in text, both
+        "The forward 12-month P/E ratio for the S&P 500 is 17.1."
+        "The bottom-up target price for the S&P 500 is 9,099.54, which is 26.8%
+         above the closing price of 7,175.83."
+    so   EPS = closing price / forward 12M P/E   (accurate to about +/-0.3 percent
+    because the P/E is printed to one decimal).
 
-Fallback chain
---------------
-1. Download this week's Earnings Insight PDF from factset.com
-2. Parse the "forward 12-month EPS estimate" value from PDF text
-3. If parse fails or PDF unavailable → return cached value (7-day TTL)
-4. Caller (spglobal.py) ultimately falls back to manual_override
+Flow
+----
+1. GET https://www.factset.com/earningsinsight (302 -> latest PDF); record the final URL.
+2. Validate HTTP status, content-type and the %PDF magic.
+3. Extract text with pypdf, normalise whitespace, apply STRICT regexes (fail closed:
+   no loose "$ anywhere" matching).
+4. Range checks (P/E 10-40, price 2000-20000, EPS 200-600) and a jump check against
+   the last good value (8 percent) unless the manual override confirms the new value.
+5. Cache the result (.cache/factset_eps_latest.json). A result fetched on the
+   current Pacific calendar day is reused: FactSet only updates weekly.
 
-Scheduling
-----------
-Run weekly, ideally Friday evening after FactSet publishes (usually ~6pm ET).
-The 7-day cache means daily refresh.py runs re-use the last successful fetch
-without hitting FactSet again until the cache expires.
-
-Sources / methodology
----------------------
-FactSet's weekly Earnings Insight defines "forward 12-month EPS" as the
-bottom-up aggregation of median analyst EPS estimates for all S&P 500
-constituents across the next four rolling quarters. This is the most
-authoritative free public index-level forward EPS source.
-
-Yardeni cross-check
--------------------
-As a sanity check, fetch the Yardeni forward EPS chart page and extract the
-printed legend value. Yardeni's methodology is slightly different (time-weighted
-average of current-year and next-year estimates) so expect a $1–5 difference
-vs FactSet — that spread is normal.
+Returns {"value", "as_of", "source": "factset", "pe", "price", "url"} or raises FetchError.
 """
 
 from __future__ import annotations
@@ -38,237 +30,235 @@ import io
 import json
 import logging
 import re
-import urllib.request
-from datetime import datetime, date, timedelta
+from datetime import date, datetime
 from pathlib import Path
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+import requests
+
+from .base import FetchError
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-_CACHE_DIR = Path(__file__).parent.parent / ".cache"
-_CACHE_DIR.mkdir(exist_ok=True)
-_FACTSET_CACHE = _CACHE_DIR / "factset_eps_latest.json"
-_CACHE_TTL_DAYS = 7  # re-fetch after 7 days
+PT = ZoneInfo("America/Los_Angeles")
 
-# ---------------------------------------------------------------------------
-# FactSet Earnings Insight PDF endpoint
-# ---------------------------------------------------------------------------
+_CACHE_DIR = Path(__file__).parent.parent / ".cache"
+_FACTSET_CACHE = _CACHE_DIR / "factset_eps_latest.json"
+
 FACTSET_PDF_URL = "https://www.factset.com/earningsinsight"
 
-# Patterns to find forward EPS in the PDF text.
-# FactSet uses various phrasings across different weekly issues.
-_EPS_PATTERNS = [
-    # e.g. "forward 12-month EPS estimate of $261.13"
-    r"forward\s+12[\-\s]month\s+EPS\s+estimate\s+(?:of\s+)?\$?\s*([\d,]+\.?\d*)",
-    # e.g. "forward 12-month EPS of $261.13"
-    r"forward\s+12[\-\s]month\s+EPS\s+(?:of\s+)?\$?\s*([\d,]+\.?\d*)",
-    # e.g. "NTM EPS estimate: $261.13"
-    r"NTM\s+EPS\s+estimate[:\s]+\$?\s*([\d,]+\.?\d*)",
-    # e.g. "bottom-up EPS estimate of $261.13 for the next 12 months"
-    r"bottom[\-\s]up\s+EPS\s+estimate\s+of\s+\$?\s*([\d,]+\.?\d*)",
-    # Fallback: any dollar figure that looks like an S&P EPS (150–600 range)
-    # after the phrase "forward" or "NTM"
-    r"(?:forward|NTM)[^$\n]{0,60}\$\s*((?:1[5-9]\d|[2-5]\d{2})(?:\.\d{1,2})?)",
-]
+PE_RANGE = (10.0, 40.0)
+PRICE_RANGE = (2000.0, 20000.0)
+EPS_RANGE = (200.0, 600.0)
+MAX_JUMP = 0.08          # |EPS - last good| / last good
+OVERRIDE_CONFIRM = 0.02  # a value within 2 percent of the owner's override is accepted regardless of jump
+_MAX_PAGES = 20
+_MAX_PDF_BYTES = 40 * 1024 * 1024
 
-# ---------------------------------------------------------------------------
-# Yardeni chart page cross-check
-# ---------------------------------------------------------------------------
-YARDENI_PAGE_URL = (
-    "https://www.yardeni.com/charts/us-stock-market/"
-    "stock-market-forward-metrics/sp-500-forward-revenues-earnings-margins"
-)
-# Yardeni embeds the current value in the chart legend text, e.g.:
-#   "Forward EPS (Apr 30 = 346.19)"
-#   "52-Week Forward EPS (Apr 30 = 346.19)"
-_YARDENI_PATTERN = re.compile(
-    r"(?:52[\-\s]Week\s+)?Forward\s+EPS[^(]*\(\w+\s+\d+\s*=\s*([\d,.]+)\)",
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/pdf,*/*;q=0.8",
+}
+
+# Strict patterns (applied to whitespace-normalised text).
+_PE_RE = re.compile(
+    r"forward 12-month P/E ratio for the S&P 500 is (\d{1,2}\.\d)(?![\d])",
     re.IGNORECASE,
 )
+_PRICE_RE = re.compile(
+    r"bottom-up target price for the S&P 500 is [\d,]+(?:\.\d+)?, "
+    r"which is \d{1,3}(?:\.\d+)?% (?:above|below) the closing price of ([\d,]+\.\d{2})",
+    re.IGNORECASE,
+)
+_MONTHS = (
+    "January|February|March|April|May|June|July|August|September|October|November|December"
+)
+_TEXT_DATE_RE = re.compile(rf"\b({_MONTHS})\s+(\d{{1,2}}),\s+(20\d{{2}})\b")
+_FILE_DATE_RE = re.compile(r"EarningsInsight_(\d{2})(\d{2})(\d{2})[A-Z]?\.pdf", re.IGNORECASE)
 
 
-def _cache_valid() -> bool:
-    """Return True if the cache exists and is within the TTL window."""
-    if not _FACTSET_CACHE.exists():
-        return False
-    mtime = datetime.fromtimestamp(_FACTSET_CACHE.stat().st_mtime)
-    return (datetime.now() - mtime).days < _CACHE_TTL_DAYS
+# ---------------------------------------------------------------------------
+# Cache
+# ---------------------------------------------------------------------------
+def _pt_today() -> date:
+    return datetime.now(PT).date()
 
 
-def _load_cache() -> dict | None:
-    """Load cached result; return None if absent or malformed."""
+def _load_cache() -> Optional[dict]:
     try:
-        with open(_FACTSET_CACHE) as f:
-            return json.load(f)
+        with open(_FACTSET_CACHE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and "value" in data and "as_of" in data:
+            return data
     except Exception:
+        pass
+    return None
+
+
+def _save_cache(result: dict, today: date) -> None:
+    payload = dict(result)
+    payload["fetched_at"] = datetime.now(PT).isoformat(timespec="seconds")
+    payload["fetched_pt_date"] = today.isoformat()
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_FACTSET_CACHE, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    log.info("[factset_eps] Cached: $%.2f as_of=%s", result["value"], result["as_of"])
+
+
+# ---------------------------------------------------------------------------
+# Download and parse
+# ---------------------------------------------------------------------------
+def _download_latest() -> tuple[bytes, str]:
+    """Follow the earningsinsight redirect; return (pdf_bytes, final_url)."""
+    try:
+        resp = requests.get(FACTSET_PDF_URL, headers=_HEADERS, timeout=60, allow_redirects=True)
+    except requests.RequestException as exc:
+        raise FetchError(f"FactSet download failed: {type(exc).__name__}: {exc}") from exc
+    if resp.status_code != 200:
+        raise FetchError(f"FactSet download returned HTTP {resp.status_code} at {resp.url}")
+    ctype = resp.headers.get("Content-Type", "").lower()
+    body = resp.content
+    if body[:4] != b"%PDF":
+        raise FetchError(
+            f"FactSet URL did not return a PDF (content-type {ctype!r}, "
+            f"first bytes {body[:8]!r}, final url {resp.url})"
+        )
+    if "pdf" not in ctype and "octet-stream" not in ctype:
+        raise FetchError(f"FactSet response has unexpected content-type {ctype!r} at {resp.url}")
+    if len(body) > _MAX_PDF_BYTES:
+        raise FetchError(f"FactSet PDF unexpectedly large ({len(body)} bytes)")
+    return body, resp.url
+
+
+def _extract_text(pdf_bytes: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:  # pragma: no cover
+        raise FetchError("pypdf is not installed") from exc
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        parts = [(p.extract_text() or "") for p in reader.pages[:_MAX_PAGES]]
+    except Exception as exc:
+        raise FetchError(f"PDF text extraction failed: {type(exc).__name__}: {exc}") from exc
+    return re.sub(r"\s+", " ", " ".join(parts))
+
+
+def _file_date(url: str) -> Optional[date]:
+    m = _FILE_DATE_RE.search(url.rsplit("/", 1)[-1].split("?")[0])
+    if not m:
+        return None
+    try:
+        return date(2000 + int(m.group(3)), int(m.group(1)), int(m.group(2)))
+    except ValueError:
         return None
 
 
-def _save_cache(value: float, source: str, as_of: str) -> None:
-    payload = {
-        "value": value,
-        "source": source,
-        "as_of": as_of,
-        "fetched_at": datetime.now().isoformat(),
-    }
-    with open(_FACTSET_CACHE, "w") as f:
-        json.dump(payload, f, indent=2)
-    log.info("[factset_eps] Cached: $%.2f  source=%s  as_of=%s", value, source, as_of)
+def _text_date(text: str) -> Optional[date]:
+    """First 'Month D, YYYY' in the first part of the report (the issue date line)."""
+    m = _TEXT_DATE_RE.search(text[:3000])
+    if not m:
+        return None
+    try:
+        return datetime.strptime(f"{m.group(1)} {m.group(2)} {m.group(3)}", "%B %d %Y").date()
+    except ValueError:
+        return None
 
 
-def _http_get(url: str, timeout: int = 30) -> bytes | None:
-    """Simple HTTP GET; returns raw bytes or None on failure."""
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/pdf,*/*",
-        },
+def parse_report(text: str, url: str = "") -> dict:
+    """
+    Parse normalised report text. Returns {"value","as_of","pe","price"}.
+    Raises FetchError with a precise reason on any miss or inconsistency.
+    """
+    pes = {m.group(1) for m in _PE_RE.finditer(text)}
+    if not pes:
+        raise FetchError("forward 12-month P/E sentence not found in FactSet PDF text")
+    if len(pes) > 1:
+        raise FetchError(f"inconsistent forward 12-month P/E values in PDF: {sorted(pes)}")
+    pe = float(next(iter(pes)))
+
+    prices = {m.group(1) for m in _PRICE_RE.finditer(text)}
+    if not prices:
+        raise FetchError("S&P 500 closing-price sentence not found in FactSet PDF text")
+    if len(prices) > 1:
+        raise FetchError(f"inconsistent closing prices in PDF: {sorted(prices)}")
+    price = float(next(iter(prices)).replace(",", ""))
+
+    if not PE_RANGE[0] <= pe <= PE_RANGE[1]:
+        raise FetchError(f"forward P/E {pe} outside {PE_RANGE}")
+    if not PRICE_RANGE[0] <= price <= PRICE_RANGE[1]:
+        raise FetchError(f"S&P 500 price {price} outside {PRICE_RANGE}")
+
+    eps = round(price / pe, 2)
+    if not EPS_RANGE[0] <= eps <= EPS_RANGE[1]:
+        raise FetchError(f"derived EPS {eps} (price {price} / P/E {pe}) outside {EPS_RANGE}")
+
+    f_date = _file_date(url)
+    t_date = _text_date(text)
+    as_of = f_date or t_date
+    if as_of is None:
+        raise FetchError("report date not found (neither file name nor first-page date line)")
+    if f_date and t_date and f_date != t_date:
+        log.warning("[factset_eps] file-name date %s differs from text date %s; using file-name date",
+                    f_date, t_date)
+    return {"value": eps, "as_of": as_of.isoformat(), "pe": pe, "price": price}
+
+
+def _check_jump(eps: float, last_good: Optional[float], override: Optional[float]) -> None:
+    if last_good is None or last_good <= 0:
+        return
+    change = abs(eps - last_good) / last_good
+    if change <= MAX_JUMP:
+        return
+    if override and abs(eps - override) / override <= OVERRIDE_CONFIRM:
+        return
+    raise FetchError(
+        f"big jump: derived EPS {eps} is {change:.1%} away from last good {last_good} "
+        f"(limit {MAX_JUMP:.0%}) and not confirmed by the manual override ({override}); "
+        "keeping previous value"
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    except Exception as exc:
-        log.warning("[factset_eps] HTTP GET failed for %s: %s", url, exc)
-        return None
 
 
-def _parse_pdf_for_eps(pdf_bytes: bytes) -> float | None:
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+def fetch_forward_eps(
+    last_good: Optional[float] = None,
+    override: Optional[float] = None,
+    use_cache: bool = True,
+) -> dict:
     """
-    Extract forward EPS from a FactSet PDF's text layer.
-    Requires pdfplumber (preferred) or pdfminer; gracefully skips if unavailable.
+    Return {"value","as_of","source":"factset","pe","price","url"} or raise FetchError.
+
+    A cached result fetched on today's Pacific date is returned without a network call.
     """
-    # Try pdfplumber first (cleaner text extraction)
-    try:
-        import pdfplumber  # type: ignore
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            full_text = "\n".join(
-                page.extract_text() or "" for page in pdf.pages[:10]
-            )
-        return _search_patterns(full_text)
-    except ImportError:
-        pass  # pdfplumber not installed
-
-    # Fall back to pdfminer
-    try:
-        from pdfminer.high_level import extract_text_to_fp  # type: ignore
-        from pdfminer.layout import LAParams
-
-        buf = io.StringIO()
-        extract_text_to_fp(
-            io.BytesIO(pdf_bytes), buf, laparams=LAParams(), output_type="text"
-        )
-        return _search_patterns(buf.getvalue())
-    except ImportError:
-        log.warning(
-            "[factset_eps] Neither pdfplumber nor pdfminer installed. "
-            "Install one: pip install pdfplumber --break-system-packages"
-        )
-        return None
-
-
-def _search_patterns(text: str) -> float | None:
-    """Apply EPS regex patterns to extracted text; return first plausible match."""
-    for pattern in _EPS_PATTERNS:
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            raw = m.group(1).replace(",", "")
-            try:
-                val = float(raw)
-                if 150 < val < 700:  # sanity-check S&P 500 EPS range
-                    log.info("[factset_eps] Parsed EPS $%.2f via pattern: %s", val, pattern[:50])
-                    return round(val, 2)
-            except ValueError:
-                continue
-    return None
-
-
-def _fetch_from_yardeni() -> tuple[float | None, str]:
-    """
-    Fetch Yardeni's forward EPS page and extract the chart legend value.
-    Returns (value, as_of_label) or (None, '').
-
-    Note: The numeric value lives in a PNG chart image legend, not in the HTML
-    body text. However, Yardeni sometimes includes it in the page's structured
-    data or in readable chart alt-text. This function reads the HTML and applies
-    the pattern — it works when Yardeni exposes the number in text; otherwise
-    returns None and the caller falls through to the manual override.
-    """
-    html = _http_get(YARDENI_PAGE_URL)
-    if html is None:
-        return None, ""
-    try:
-        text = html.decode("utf-8", errors="replace")
-        m = _YARDENI_PATTERN.search(text)
-        if m:
-            val = float(m.group(1).replace(",", ""))
-            if 150 < val < 700:
-                return round(val, 2), f"Yardeni chart page {date.today()}"
-    except Exception as exc:
-        log.warning("[factset_eps] Yardeni parse error: %s", exc)
-    return None, ""
-
-
-def fetch_forward_eps() -> dict | None:
-    """
-    Main entry point. Returns:
-        {"value": float, "source": str, "as_of": str}
-    or None if all paths fail.
-
-    Call order:
-        1. Return cache if valid and fresh
-        2. Try FactSet PDF → parse EPS
-        3. Try Yardeni page → parse chart legend
-        4. Return stale cache if present (better than nothing)
-    """
-    # 1. Fresh cache
-    if _cache_valid():
+    today = _pt_today()
+    if use_cache:
         cached = _load_cache()
-        if cached:
-            log.info(
-                "[factset_eps] Using cache: $%.2f  source=%s  fetched=%s",
-                cached["value"], cached["source"], cached.get("fetched_at", "?")
-            )
-            return cached
+        if cached and cached.get("fetched_pt_date") == today.isoformat():
+            log.info("[factset_eps] Reusing today's cached result: $%.2f as_of=%s",
+                     cached["value"], cached["as_of"])
+            return {k: cached.get(k) for k in ("value", "as_of", "source", "pe", "price", "url")}
 
-    as_of = date.today().isoformat()
+    log.info("[factset_eps] Fetching latest FactSet Earnings Insight PDF")
+    pdf_bytes, final_url = _download_latest()
+    log.info("[factset_eps] Final URL: %s (%d bytes)", final_url, len(pdf_bytes))
+    parsed = parse_report(_extract_text(pdf_bytes), final_url)
+    _check_jump(parsed["value"], last_good, override)
 
-    # 2. FactSet PDF
-    log.info("[factset_eps] Fetching FactSet Earnings Insight PDF...")
-    pdf_bytes = _http_get(FACTSET_PDF_URL)
-    if pdf_bytes and pdf_bytes[:4] == b"%PDF":
-        eps = _parse_pdf_for_eps(pdf_bytes)
-        if eps:
-            result = {"value": eps, "source": "factset_pdf", "as_of": as_of}
-            _save_cache(eps, "factset_pdf", as_of)
-            return result
-        log.warning("[factset_eps] Downloaded PDF but could not parse EPS value")
-    else:
-        log.warning("[factset_eps] FactSet URL did not return a PDF (may redirect to HTML)")
-
-    # 3. Yardeni page
-    log.info("[factset_eps] Trying Yardeni chart page...")
-    yval, ylabel = _fetch_from_yardeni()
-    if yval:
-        result = {"value": yval, "source": "yardeni_html", "as_of": as_of}
-        _save_cache(yval, "yardeni_html", as_of)
-        return result
-
-    # 4. Stale cache (better than nothing)
-    stale = _load_cache()
-    if stale:
-        log.warning(
-            "[factset_eps] All live fetches failed — returning stale cache "
-            "(fetched %s, value $%.2f)",
-            stale.get("fetched_at", "?"), stale["value"]
-        )
-        return stale
-
-    log.warning("[factset_eps] All paths failed — no EPS available from factset_eps fetcher")
-    return None
+    result = {
+        "value": parsed["value"],
+        "as_of": parsed["as_of"],
+        "source": "factset",
+        "pe": parsed["pe"],
+        "price": parsed["price"],
+        "url": final_url,
+    }
+    _save_cache(result, today)
+    log.info("[factset_eps] EPS %.2f = %.2f / %.1f (as of %s)",
+             result["value"], result["price"], result["pe"], result["as_of"])
+    return result
