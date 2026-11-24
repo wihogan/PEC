@@ -237,15 +237,6 @@ def test_record_month_end_default_today_is_pacific(monkeypatch):
     assert _entries() == {"2026-11-30": 401.0}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "spglobal.record_month_end: an as_of in a LATER month than today is matched under its own "
-        "month key but dated min(as_of, today), i.e. in the current month, so it creates a second "
-        "entry for the current month (reachable only with a future-dated as_of, e.g. a hand-edited "
-        "override effective_date)."
-    ),
-)
 def test_record_month_end_future_month_as_of_does_not_duplicate_current_month(seed):
     spglobal.record_month_end(date(2026, 11, 20), 419.64, today=date(2026, 11, 30))
     spglobal.record_month_end(date(2026, 12, 2), 425.0, today=date(2026, 11, 30))

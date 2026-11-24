@@ -38,7 +38,7 @@ case "$cmd" in
     export TZ=America/Los_Angeles
     today="$(date +%Y-%m-%d)"
     if date --version >/dev/null 2>&1; then
-      since="$(date -u -d "${today} 00:00:00" +%Y-%m-%dT%H:%M:%SZ)"
+      since="$(date -u -d "@$(date -d "${today} 00:00:00" +%s)" +%Y-%m-%dT%H:%M:%SZ)"  # midnight PT, not UTC (D5)
     else
       since="$(date -u -r "$(date -j -f '%Y-%m-%d %H:%M:%S' "${today} 00:00:00" +%s)" +%Y-%m-%dT%H:%M:%SZ)"
     fi

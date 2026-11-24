@@ -172,7 +172,7 @@ def pending_notice(today: Optional[date] = None) -> Optional[str]:
     raw = _read_raw()
     if not raw:
         return None
-    notified = raw.get("notified") if isinstance(raw.get("notified"), dict) else {}
+    notified = dict(raw["notified"]) if isinstance(raw.get("notified"), dict) else {}  # copy: change detection (D4)
     msgs = []
     failing = int(raw.get("fail_days") or 0) >= NOTICE_FAIL_DAYS
     stale_days = None

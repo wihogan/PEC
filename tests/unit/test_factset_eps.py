@@ -491,15 +491,6 @@ def test_success_resets_failure_streak_keeps_markers(pt_clock, monkeypatch):
     assert raw["fail_days"] == 0 and raw["last_fail_date"] is None and raw["notified"] == {"failing": True}
 
 
-NOTICE_MARKER_DEFECT = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "factset_eps.pending_notice: `notified` aliases raw['notified'] and is mutated in place, so "
-        "`notified != raw['notified']` is always False when the cache already has a 'notified' dict "
-        "(every successful fetch writes one). Markers are then never written: the notice repeats on "
-        "every run and a cleared condition never re-arms."
-    ),
-)
 
 
 def test_notice_none_without_cache():
@@ -519,7 +510,6 @@ def test_notice_after_two_failing_days_sent_once(pt_clock, monkeypatch):
     assert _raw()["notified"] == {"failing": True}
 
 
-@NOTICE_MARKER_DEFECT
 def test_notice_rearms_after_recovery(pt_clock, monkeypatch):
     _fail(pt_clock, monkeypatch, 23)
     _fail(pt_clock, monkeypatch, 24)
@@ -539,7 +529,7 @@ def test_notice_rearms_after_recovery(pt_clock, monkeypatch):
 
 @pytest.mark.parametrize(
     "today, expect",
-    [(date(2026, 11, 30), False), pytest.param(date(2026, 12, 1), True, marks=NOTICE_MARKER_DEFECT)],
+    [(date(2026, 11, 30), False), pytest.param(date(2026, 12, 1), True)],
 )
 def test_notice_stale_as_of_over_10_days(today, expect):
     fe._write_raw({"value": 419.64, "as_of": "2026-11-20", "fail_days": 0, "notified": {}})
@@ -553,7 +543,6 @@ def test_notice_stale_as_of_over_10_days(today, expect):
         assert msg is None
 
 
-@NOTICE_MARKER_DEFECT
 def test_notice_both_conditions_in_one_message():
     fe._write_raw({"value": 419.64, "as_of": "2026-11-01", "fail_days": 3, "notified": {}})
     msg = fe.pending_notice(date(2026, 11, 23))
@@ -568,7 +557,6 @@ def test_notice_one_condition_already_sent_other_new():
     assert "22 days old" in msg and "consecutive" not in msg
 
 
-@NOTICE_MARKER_DEFECT
 def test_notice_marker_persists_value_fields():
     fe._write_raw({"value": 419.64, "as_of": "2026-11-01", "fail_days": 0, "notified": {}, "url": "u"})
     fe.pending_notice(date(2026, 11, 23))
@@ -582,7 +570,6 @@ def test_notice_message_when_cache_has_empty_notified_dict():
     assert "22 days old" in fe.pending_notice(date(2026, 11, 23))
 
 
-@NOTICE_MARKER_DEFECT
 def test_notice_sent_once_after_success_then_two_failing_days(pt_clock, monkeypatch):
     """Realistic sequence: a success (cache has notified={}), then failures on two PT days."""
     monkeypatch.setattr(fe.requests, "get", FakeGet())

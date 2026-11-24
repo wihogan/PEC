@@ -301,6 +301,8 @@ def record_month_end(as_of: date, value: float, today: Optional[date] = None) ->
             if d != month_end and month_end < today:
                 e["date"] = month_end.isoformat()
                 modified = True
+        if as_of > today:
+            as_of = today  # never key a future month (D6)
         key = f"{as_of.year}-{as_of.month:02d}"
         val = round(float(value), 2)
         for e in entries:

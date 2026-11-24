@@ -37,15 +37,6 @@ TODAY = _iso(NOW - timedelta(seconds=30))
 YESTERDAY = _iso(TODAY_PT_MIDNIGHT - timedelta(minutes=1))            # 23:59 PT yesterday
 YESTERDAY_AFTERNOON = _iso(TODAY_PT_MIDNIGHT - timedelta(hours=9))     # 15:00 PT yesterday
 
-PT_MIDNIGHT_DEFECT = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "tools/pec_runs.sh failures-today (GNU date path): `date -u -d \"$today 00:00:00\"` parses the "
-        "time as UTC, so 'today' starts at 00:00 UTC = 16:00 PST / 17:00 PDT the previous day; failed "
-        "production runs created in that evening window count as today's and can suppress the first "
-        "alert of the PT day (M4). The macOS (-j -f) path is correct."
-    ),
-)
 
 
 def run(rid, conclusion, created=TODAY, title="PEC refresh [state]", status="completed"):
@@ -133,7 +124,6 @@ def test_failures_today_none(gh):
     assert gh("failures-today", runs=[run(2, "failure", created=YESTERDAY_AFTERNOON)]).stdout.strip() == "0"
 
 
-@PT_MIDNIGHT_DEFECT
 def test_failures_today_excludes_yesterday_evening_pt(gh):
     assert gh("failures-today", runs=[run(2, "failure", created=YESTERDAY)]).stdout.strip() == "0"
 
