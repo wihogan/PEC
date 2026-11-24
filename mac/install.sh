@@ -1,7 +1,8 @@
 #!/bin/bash
 # Install the PEC Mac jobs (launchd): refresh trigger (Mon-Fri PT: hourly at :45 06:45-12:45,
 # then 13:20 post-close final and 15:50 retry)
-# and watchdog (16:30 PT, Mon-Fri). The Mac's clock/timezone must be Pacific.
+# and watchdog (16:30 PT, Mon-Fri). The Mac's clock/timezone must be Pacific and the user
+# must be logged in (LaunchAgents do not run at the login window).
 # Usage: mac/install.sh [--dry-run] [--reset-secrets] [--test]
 #   --dry-run        print what would happen; change nothing
 #   --reset-secrets  re-prompt for the Telegram token and chat id
@@ -24,6 +25,14 @@ done
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "install.sh: this installer is for macOS only (found $(uname -s)). Nothing done." >&2
   exit 1
+fi
+
+# The schedule is in local time and the market logic is Pacific: warn if the Mac is not.
+tz_name="$(systemsetup -gettimezone 2>/dev/null | sed 's/^Time Zone: //')"
+[ -n "$tz_name" ] || tz_name="$(readlink /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##')"
+if [ "$tz_name" != "America/Los_Angeles" ]; then
+  echo "WARNING: the Mac time zone is '${tz_name:-unknown}', not America/Los_Angeles." >&2
+  echo "         The launchd times are local time; set System Settings > General > Date & Time to Pacific." >&2
 fi
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
@@ -134,7 +143,7 @@ PL
     for hm in $times; do
       h="${hm%%:*}"; m="${hm##*:}"
       for d in 1 2 3 4 5; do
-        echo "    <dict><key>Weekday</key><integer>$d</integer><key>Hour</key><integer>$h</integer><key>Minute</key><integer>$((10#$m))</integer></dict>"
+        echo "    <dict><key>Weekday</key><integer>$d</integer><key>Hour</key><integer>$((10#$h))</integer><key>Minute</key><integer>$((10#$m))</integer></dict>"
       done
     done
     cat <<PL
@@ -151,7 +160,12 @@ write_plist com.pec.watchdog pec-watchdog.sh launchd-watchdog "16:30"
 # --- launchd ----------------------------------------------------------
 for label in com.pec.trigger com.pec.watchdog; do
   run launchctl bootout "gui/${UID_N}/${label}" 2>/dev/null || true
-  run launchctl bootstrap "gui/${UID_N}" "$AGENTS/${label}.plist"
+  if ! run launchctl bootstrap "gui/${UID_N}" "$AGENTS/${label}.plist"; then
+    echo "bootstrap of ${label} failed; retrying once after 1 s" >&2
+    sleep 1
+    run launchctl bootstrap "gui/${UID_N}" "$AGENTS/${label}.plist" \
+      || { echo "ERROR: could not load ${label} (see: launchctl print gui/${UID_N}/${label})" >&2; exit 1; }
+  fi
 done
 
 say "status"

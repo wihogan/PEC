@@ -22,7 +22,7 @@ Hard-fail rules:
   6. valuation_inputs.forward_eps_ntm is the config override (source override), or a FactSet
      value (source factset) dated after the override's effective_date and within 200-600.
 
-Pure stdlib + PyYAML.
+Pure stdlib + PyYAML (and the repo's market_calendar).
 """
 from __future__ import annotations
 
@@ -36,6 +36,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 import yaml
+
+import market_calendar
 
 HERE = Path(__file__).resolve().parent
 
@@ -60,6 +62,8 @@ THRESHOLDS: dict = {
     # Derived / valuation inputs (warn only).
     "warn_fwd_pe_history_days": 60,
     "warn_eps_effective_days": 45,
+    # Warn when the NYSE calendar table ends within this many days (m5)
+    "warn_calendar_end_days": 60,
     # Rule 3
     "html_min_bytes": 1_500_000,
     # Rule 4
@@ -223,10 +227,11 @@ def run_checks(data_path: Path, html_path: Path, config_path: Path, now: datetim
 
         # Rule 4: attempted this run
         def attempted(sid: str) -> bool:
+            # Attempted this run iff its last_attempt (old state: last_fetched) equals
+            # metadata.last_refreshed. A carried-forward error from an earlier run does not count.
             st = statuses.get(sid) or {}
-            if st.get("status") == "error":
-                return True
-            return bool(last_refreshed) and st.get("last_fetched") == last_refreshed
+            stamp = st.get("last_attempt") or st.get("last_fetched")
+            return bool(last_refreshed) and stamp == last_refreshed
 
         def failed(sid: str) -> bool:
             return (statuses.get(sid) or {}).get("status") == "error"
@@ -323,6 +328,15 @@ def run_checks(data_path: Path, html_path: Path, config_path: Path, now: datetim
                     f"{EPS_VI_ID} effective_date {eff.isoformat()} is {eps_age} days old "
                     f"(warn > {THRESHOLDS['warn_eps_effective_days']})"
                 )
+
+    # m5: the NYSE holiday table ends with market_calendar.CALENDAR_YEARS.
+    cal_end = date(max(market_calendar.CALENDAR_YEARS), 12, 31)
+    days_left = (cal_end - today).days
+    if days_left <= THRESHOLDS["warn_calendar_end_days"]:
+        warnings.append(
+            f"market_calendar covers NYSE holidays only to {cal_end.isoformat()} "
+            f"({days_left} days left); add the next year to market_calendar.py"
+        )
 
     # Rule 3 (runs even if rule 1 failed; script/data comparison skipped then)
     check_html(html_path, data, failures)

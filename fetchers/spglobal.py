@@ -33,6 +33,7 @@ import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -265,13 +266,16 @@ def _ensure_history(current_value: float) -> None:
         )
 
 
-def record_month_end(as_of: date, value: float) -> bool:
+def record_month_end(as_of: date, value: float, today: Optional[date] = None) -> bool:
     """
-    Upsert the month-end history entry for as_of's month (FactSet automation).
+    Upsert the history entry for as_of's month (forward-EPS automation: FactSet or override).
 
-    - Entry date is the CALENDAR month-end (matches config/forward_eps_seed.yaml
-      convention, e.g. 2026-10-31). An existing entry for that year-month keeps its
-      own date key and only has its value replaced (latest report of the month wins).
+    - A month that has ended is dated its CALENDAR month-end (matches
+      config/forward_eps_seed.yaml, e.g. 2026-10-31). The in-progress month is dated
+      `as_of` (never a future date); once the month has ended, any such entry is
+      re-dated to the month-end the next time this function runs.
+    - An existing entry for the same year-month keeps its value unless it differs
+      (latest report of the month wins).
     - Seed entries for months missing from the cache are merged in first, so adding
       backfill rows to the seed also reaches an existing cache.
     - Only the history cache is written (persisted on the state branch by
@@ -280,6 +284,7 @@ def record_month_end(as_of: date, value: float) -> bool:
     Returns True if the history cache was modified. Never raises.
     """
     try:
+        today = today or datetime.now(ZoneInfo("America/Los_Angeles")).date()
         entries = _load_history_entries()
         have = {str(e["date"])[:7] for e in entries}
         modified = False
@@ -288,6 +293,14 @@ def record_month_end(as_of: date, value: float) -> bool:
                 entries.append(e)
                 have.add(e["date"][:7])
                 modified = True  # seed rows must reach an existing cache (D3)
+        # Re-date entries of months that have since ended to their calendar month-end.
+        for e in entries:
+            d = date.fromisoformat(str(e["date"])[:10])
+            last = calendar.monthrange(d.year, d.month)[1]
+            month_end = date(d.year, d.month, last)
+            if d != month_end and month_end < today:
+                e["date"] = month_end.isoformat()
+                modified = True
         key = f"{as_of.year}-{as_of.month:02d}"
         val = round(float(value), 2)
         for e in entries:
@@ -298,7 +311,9 @@ def record_month_end(as_of: date, value: float) -> bool:
                 break
         else:
             last_day = calendar.monthrange(as_of.year, as_of.month)[1]
-            entries.append({"date": date(as_of.year, as_of.month, last_day).isoformat(), "value": val})
+            month_end = date(as_of.year, as_of.month, last_day)
+            entry_date = month_end if month_end < today else min(as_of, today)
+            entries.append({"date": entry_date.isoformat(), "value": val})
             modified = True
         entries.sort(key=lambda e: str(e["date"]))
         if modified or not _HISTORY_JSON.exists():

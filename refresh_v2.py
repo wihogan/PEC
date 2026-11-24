@@ -69,7 +69,7 @@ import logging
 import math
 import os
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -301,6 +301,8 @@ def _write_eps_change_flag(prev: Optional[dict], new: Optional[dict]) -> None:
         if not new or new.get("value") is None or not prev or prev.get("value") is None:
             return
         old_v, new_v = float(prev["value"]), float(new["value"])
+        if round(old_v, 2) == round(new_v, 2):
+            return  # same value (e.g. FactSet -> identical override): nothing to report
         switched = prev.get("source") != new.get("source")
         moved = old_v > 0 and abs(new_v - old_v) / old_v > EPS_CHANGE_THRESHOLD
         if not (switched or moved):
@@ -316,11 +318,33 @@ def _write_eps_change_flag(prev: Optional[dict], new: Optional[dict]) -> None:
         log.warning("Could not write EPS change flag: %s", exc)
 
 
+def _append_factset_notice(fetchers: dict) -> None:
+    """
+    Append the once-per-condition FactSet health notice (2 consecutive failing PT days,
+    or as_of older than 10 days) to eps_change.txt so the workflow sends it after the
+    healthcheck. Only in PEC_EPS_MODE=factset. Never raises.
+    """
+    try:
+        if _eps_mode() != "factset":
+            return
+        fs_mod = fetchers.get("factset_eps")
+        if fs_mod is None or not hasattr(fs_mod, "pending_notice"):
+            return
+        text = fs_mod.pending_notice()
+        if text:
+            with open(EPS_CHANGE_FLAG, "a", encoding="utf-8") as fh:
+                fh.write(text.rstrip("\n") + "\n")
+            log.info("FactSet notice queued: %s", text.strip().splitlines()[0])
+    except Exception as exc:  # pragma: no cover
+        log.warning("Could not append FactSet notice: %s", exc)
+
+
 def _fetch_valuation_inputs(
     vi_config: dict,
     fetchers:  dict,
     statuses:  dict,
     previous:  Optional[dict] = None,
+    now_ts:    Optional[str] = None,
 ) -> dict:
     """
     Process all entries under config['valuation_inputs'].
@@ -374,6 +398,7 @@ def _fetch_valuation_inputs(
         # Attempt 1: live fetcher
         # ----------------------------------------------------------------
         live_error: Optional[Exception] = None
+        fs_error:   Optional[str]       = None   # FactSet failure text (status under forward_eps_ntm)
         fetcher_module = fetchers.get(fetcher_name)
 
         if fetcher_module is None:
@@ -401,6 +426,7 @@ def _fetch_valuation_inputs(
                 )
             except Exception as exc:
                 live_error = exc
+                fs_error = f"{type(exc).__name__}: {exc}"[:300]
                 log.warning("[%s] FactSet fetch failed: %s", vi_id, exc)
             if fs is not None:
                 fs_date = _parse_iso_date(fs.get("as_of"))
@@ -409,9 +435,6 @@ def _fetch_valuation_inputs(
                     extras = {"as_of": effective_date, "url": fs.get("url")}
                     log.info("[%s] Using FactSet — value=%s as_of=%s (override %s dated %s)",
                              vi_id, value, effective_date, ov_value, ov_date)
-                    sp_mod = fetchers.get("spglobal")
-                    if sp_mod is not None and hasattr(sp_mod, "record_month_end"):
-                        sp_mod.record_month_end(fs_date, value)
                 else:
                     log.info("[%s] FactSet as_of %s is not newer than override %s — override wins",
                              vi_id, fs.get("as_of"), ov_date)
@@ -468,6 +491,20 @@ def _fetch_valuation_inputs(
                 )
 
         # ----------------------------------------------------------------
+        # Month-end EPS history: whenever a forward EPS value is in effect (FactSet or
+        # override). Ended months are dated the month-end; the in-progress month is
+        # dated as_of/today (never in the future) and re-dated when the month ends.
+        # ----------------------------------------------------------------
+        if mode and source in ("factset", "override") and value is not None:
+            sp_mod = fetchers.get("spglobal")
+            eff_d = _parse_iso_date(effective_date)
+            if sp_mod is not None and hasattr(sp_mod, "record_month_end") and eff_d is not None:
+                today_pt = datetime.now(PT).date()
+                sp_mod.record_month_end(eff_d, value)
+                if (eff_d.year, eff_d.month) != (today_pt.year, today_pt.month):
+                    sp_mod.record_month_end(today_pt, value)
+
+        # ----------------------------------------------------------------
         # History block — try fetcher's history=True API; graceful on failure
         # ----------------------------------------------------------------
         history_block: Optional[dict] = None
@@ -507,8 +544,13 @@ def _fetch_valuation_inputs(
                 "status": "warning",
                 "error":  str(live_error) if live_error else "no data source available",
             }
+        elif fs_error:
+            # FactSet failed (value carried forward / override in effect): record it.
+            statuses[vi_id] = {"status": "error", "error": fs_error}
         else:
             statuses[vi_id] = {"status": "ok"}
+        if now_ts and vi_id in statuses:
+            statuses[vi_id]["last_attempt"] = now_ts
 
     return vi_out
 
@@ -571,6 +613,26 @@ def _parse_last_fetched(text: str) -> datetime:
     return dt.replace(tzinfo=PT) if dt.tzinfo is None else dt
 
 
+def _safe_parse_stamp(text, sid: str = "?") -> Optional[datetime]:
+    """Parse a status timestamp; None (with a warning) if absent or unparseable (m12)."""
+    if not text:
+        return None
+    try:
+        return _parse_last_fetched(str(text))
+    except (TypeError, ValueError):
+        log.warning("[%s] unparseable status timestamp %r - treating as never fetched", sid, text)
+        return None
+
+
+# Crypto trades around the clock (no session close; bar dates are UTC), so the
+# "has the closing bar arrived" data test does not apply to these series.
+CONTINUOUS_SERIES = frozenset({"btc_usd", "eth_usd", "xrp_usd"})
+
+# Data-based re-fetch after the close is bounded: no re-fetch after this PT time
+# on the trading day itself (the next market open fetches again anyway).
+REFETCH_CUTOFF_PT = time(18, 0)
+
+
 def _period_start(today: date, months: int) -> date:
     """First day of the most recently ended calendar period (month=1, quarter=3)."""
     if months == 1:
@@ -590,43 +652,71 @@ def _needs_refresh(
     last_obs: Optional[date] = None,
     publish_lag_bd: int = 0,
     now: Optional[datetime] = None,
+    session_series: bool = True,
 ) -> bool:
     """
     Return True if this series should be fetched on this run (Amendment B).
 
     existing_statuses : metadata.statuses of the prior data_v2.json, keyed by series id
-                        ({status, last_fetched (naive PT ISO), error?}).
+                        ({status, last_fetched, last_attempt, error?}; stamps are naive PT ISO).
     last_obs          : last non-null observation date stored for the series
                         (see _last_observation_date); None if no data stored.
-    publish_lag_bd    : daily_release only — trading days between an observation's
+    publish_lag_bd    : daily_release only - trading days between an observation's
                         date and its publication (FRED 1, Treasury 0).
     now               : aware datetime override (tests / simulation); default now.
+    session_series    : intraday only - False for series without a session close (crypto):
+                        they keep the fetch-time rule after the close.
 
     Time zones: trading-day logic (open/close, last completed trading day) uses
     ET; calendar logic (once-per-day throttle, ended month/quarter) uses
-    Pacific time, the zone of last_fetched and of the CI runner (TZ=America/Los_Angeles).
+    Pacific time, the zone of the stamps and of the CI runner (TZ=America/Los_Angeles).
+
+    Rules after the close:
+      * intraday, exchange-traded: satisfied only once last_obs >= last completed
+        trading day. A successful fetch stamped after the close is not enough, because
+        Yahoo can deliver the day's bar hours late. The data-based re-fetch stops at
+        18:00 PT on that trading day, after which the fetch-time rule applies.
+      * intraday crypto and daily_after_close (multpl): satisfied by fetch time
+        (a successful fetch at/after the last completed close). multpl is deliberately
+        not data-tested: its table is down/irregular and its row dates do not follow
+        trading days, so a data test would poll it all evening.
 
     A series whose last status is "error" is never satisfied. Intraday,
     daily_after_close and daily_release series retry on every run; monthly and
-    quarterly series retry at most once per Pacific calendar day (the throttle
-    keys on the last successful fetch).
+    quarterly errors are throttled on last_attempt to at most one attempt per Pacific
+    calendar day (and are retried even when the expected period is present).
+    An unparseable timestamp counts as never fetched.
     """
     now = now or datetime.now(PT)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=PT)  # a naive override is Pacific time, not the process zone
     now_et = now.astimezone(ET)
     now_pt = now.astimezone(PT)
     st = existing_statuses.get(sid, {}) or {}
-    last_str = st.get("last_fetched")
-    if not last_str:
-        return True  # never fetched
-    last = _parse_last_fetched(last_str)
+    last = _safe_parse_stamp(st.get("last_fetched"), sid)
     errored = st.get("status") == "error"
+    attempt = _safe_parse_stamp(st.get("last_attempt"), sid) or last
+
+    if last is None and not (errored and attempt is not None):
+        return True  # never fetched
 
     if frequency in ("intraday", "daily_after_close"):
         if frequency == "intraday" and market_calendar.market_is_open(now_et):
             return True
-        if errored:
+        if errored or last is None:
             return True
         lctd = market_calendar.last_completed_trading_day(now_et)
+        if frequency == "intraday" and session_series and last_obs is not None:
+            if last_obs >= lctd:
+                return False
+            if last < market_calendar.close_datetime_et(lctd):
+                return True
+            # Fetched after the close but the closing bar is missing: keep trying
+            # until 18:00 PT on the trading day itself.
+            lctd_pt = market_calendar.close_datetime_et(lctd).astimezone(PT).date()
+            if now_pt.date() == lctd_pt and now_pt.time() < REFETCH_CUTOFF_PT:
+                return True
+            return False
         # satisfied once a fetch happened at/after the last completed close
         return last < market_calendar.close_datetime_et(lctd)
 
@@ -639,14 +729,17 @@ def _needs_refresh(
 
     if frequency in ("monthly", "quarterly"):
         today = now_pt.date()
+        if errored:
+            # An errored series is never satisfied; retry at most once per PT day.
+            return attempt is None or attempt.astimezone(PT).date() < today
         if last_obs is not None and last_obs >= _period_start(
             today, 1 if frequency == "monthly" else 3
         ):
             return False  # expected period already present
-        # Errors are retried on the next calendar day: the once-per-day throttle governs.
-        return last.astimezone(PT).date() < today  # at most once per calendar day
+        # Not yet satisfied: at most one attempt per PT calendar day.
+        return (attempt or last).astimezone(PT).date() < today
 
-    return True  # unknown frequency — always fetch
+    return True  # unknown frequency - always fetch
 
 
 def render(output: dict) -> None:
@@ -909,6 +1002,7 @@ def run(filter_ids: Optional[list] = None, force: bool = False) -> None:
             sid, frequency, existing_statuses,
             last_obs=_last_observation_date(existing_series.get(sid)),
             publish_lag_bd=lag,
+            session_series=sid not in CONTINUOUS_SERIES,
         ):
             if sid in existing_series:
                 series_out[sid] = existing_series[sid]
@@ -929,7 +1023,7 @@ def run(filter_ids: Optional[list] = None, force: bool = False) -> None:
 
             n_obs = len(data["dates"])
             series_out[sid] = data
-            statuses[sid]   = {"status": "ok", "last_fetched": now_ts}
+            statuses[sid]   = {"status": "ok", "last_fetched": now_ts, "last_attempt": now_ts}
             log.info("[%s] OK — %d observations", sid, n_obs)
 
         except Exception as exc:
@@ -943,6 +1037,7 @@ def run(filter_ids: Optional[list] = None, force: bool = False) -> None:
                 "status":       "error",
                 "error":        msg,
                 "last_fetched": existing_statuses.get(sid, {}).get("last_fetched"),
+                "last_attempt": now_ts,
             }
             failures.append(sid)
 
@@ -957,8 +1052,10 @@ def run(filter_ids: Optional[list] = None, force: bool = False) -> None:
         log.info("Processing %d valuation input(s)...", len(vi_config))
         try:
             prev_vi = existing.get("valuation_inputs") or {}
-            vi_out = _fetch_valuation_inputs(vi_config, fetchers, statuses, previous=prev_vi)
+            vi_out = _fetch_valuation_inputs(vi_config, fetchers, statuses, previous=prev_vi,
+                                             now_ts=now_ts)
             _write_eps_change_flag(prev_vi.get("forward_eps_ntm"), vi_out.get("forward_eps_ntm"))
+            _append_factset_notice(fetchers)
         except Exception as exc:
             log.error(
                 "Valuation inputs processing raised unexpectedly: %s — "

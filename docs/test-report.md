@@ -68,3 +68,15 @@ multpl.com is down. Healthcheck passes because these series are warn-only, which
 ## To re-run after the D1 fix and Amendment B code land
 
 6.2-3, 6.2-4 (new skip rules), 6.2-6c, 6.2-10, then 6.2-4b / 6.2-8 / 6.2-9 by observation.
+
+## Amendment B re-run (QA 2026-11-24)
+
+The items listed above for re-run (6.2-3, 6.2-4, 6.2-6c, 6.2-10) were covered by the independent QA on `amendment-b` @ e4116f5 against `state-test` with `deploy=false`; the evidence is in `docs/qa.md` section 8:
+
+| Item | QA run | Result |
+|---|---|---|
+| 6.2-3 / 6.2-4 (forced run, then skip rules) | 45317883934 (force), 45318738088 (default) | success; 36/41 fetched then 35 skipped, multpl outage tolerated |
+| 6.2-6c (failure injection, gate) | 45319005518 (`stale_state`) | failure as expected at rule 5; state unchanged; Telegram HTTP 200 |
+| 6.2-10 (EPS override / FactSet precedence) | 45319284815, 45319479573, 45319693938 | override wins when newer; FactSet wins when newer; restore OK |
+
+The Phase 6 fixes made after that QA (docs/plan.md, "Phase 6 QA fixes") have unit tests but no live run yet. 6.2-4b, 8 and 9 remain pending observation; D2 is dropped (see plan Amendment A).

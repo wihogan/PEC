@@ -69,6 +69,6 @@ To check the Telegram path from GitHub: Actions, alert-test, Run workflow.
 ## 8. Rollback
 
 - Bad data published: the last good data is in `state`; re-run refresh with `force` after the source recovers. An earlier page cannot be re-deployed directly; instead revert the code commit on main (GitHub, Commits, Revert) and re-run refresh.
-- Bad EPS: run the EPS update again with the correct value (a manual entry dated today or later beats FactSet until the next FactSet report), or set `PEC_EPS_MODE` to `override`.
+- Bad EPS: run the EPS update again with the correct value (a manual entry dated today beats FactSet until a FactSet report dated after it appears; future dates are rejected by `set_eps.py`), or set `PEC_EPS_MODE` to `override`.
 - Stop everything: `bash mac/uninstall.sh` and disable the workflow (Actions, refresh, three dots, Disable workflow). The old laptop process remains as documented in the migration handoff.
 - Broken `state`: delete the `state` branch on GitHub; the next run reseeds it from the saved baseline (it logs a loud warning).

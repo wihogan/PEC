@@ -1,6 +1,7 @@
 #!/bin/bash
-# PEC: weekday watchdog. Alerts via Telegram if no successful production refresh
-# run exists today (PT). Production runs are identified by the run title suffix
+# PEC: weekday watchdog. Alerts via Telegram if no successful POST-CLOSE production
+# refresh run exists today (created at or after 13:00 PT; early-close days also pass by
+# then), so a morning success cannot hide missing post-close runs. Production runs are identified by the run title suffix
 # "[state]" set by `run-name` in refresh.yml, so state-test runs are ignored.
 set +x
 set -u
@@ -46,16 +47,16 @@ fi
 today="$(date +%Y-%m-%d)"
 now_hm="$(date +%H:%M)"
 
-# Today's 00:00 Pacific as UTC ISO (BSD date on macOS, GNU date elsewhere).
+# Today's 13:00 Pacific as UTC ISO (BSD date on macOS, GNU date elsewhere).
 if date --version >/dev/null 2>&1; then
-  epoch="$(date -d "${today} 00:00:00" +%s)"
+  epoch="$(date -d "${today} 13:00:00" +%s)"
   since="$(date -u -d "@${epoch}" +%Y-%m-%dT%H:%M:%SZ)"
 else
-  epoch="$(date -j -f '%Y-%m-%d %H:%M:%S' "${today} 00:00:00" +%s)"
+  epoch="$(date -j -f '%Y-%m-%d %H:%M:%S' "${today} 13:00:00" +%s)"
   since="$(date -u -r "${epoch}" +%Y-%m-%dT%H:%M:%SZ)"
 fi
 
-summary="$("$GH" run list -R "$REPO" -w refresh.yml --limit 20 \
+summary="$("$GH" run list -R "$REPO" -w refresh.yml --branch main --limit 50 \
   --json conclusion,status,createdAt,event,headBranch,displayTitle \
   -q "[.[] | select(.headBranch==\"main\" and (.displayTitle|endswith(\"[state]\")) and .createdAt >= \"${since}\")] | \"\(map(select(.conclusion==\"success\")) | length) \(map(select(.status!=\"completed\")) | length) \(length)\"" 2>&1)"
 rc=$?
@@ -74,8 +75,8 @@ if [ "${ok:-0}" -gt 0 ]; then
   exit 0
 fi
 if [ "${active:-0}" -gt 0 ]; then
-  send_telegram "⏳ PEC: refresh still in progress as of ${now_hm} PT, no successful run yet today — ${ACTIONS_URL}"
+  send_telegram "⏳ PEC: refresh still in progress as of ${now_hm} PT, no successful post-close run yet today — ${ACTIONS_URL}"
   exit 0
 fi
-send_telegram "⚠️ PEC: no successful refresh today as of ${now_hm} PT — trigger manually: ${ACTIONS_URL}"
+send_telegram "⚠️ PEC: no successful post-close refresh (since 13:00 PT) as of ${now_hm} PT — trigger manually: ${ACTIONS_URL}"
 exit 0

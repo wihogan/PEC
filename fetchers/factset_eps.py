@@ -18,8 +18,11 @@ Flow
    no loose "$ anywhere" matching).
 4. Range checks (P/E 10-40, price 2000-20000, EPS 200-600) and a jump check against
    the last good value (8 percent) unless the manual override confirms the new value.
-5. Cache the result (.cache/factset_eps_latest.json). A result fetched on the
-   current Pacific calendar day is reused: FactSet only updates weekly.
+5. Cache the result (.cache/factset_eps_latest.json). A cached result is reused only if
+   it was fetched today (PT) at or after 13:00 PT and its as_of is under 6 days old;
+   otherwise FactSet is re-checked (the report can appear on a Friday after the
+   first run of the day). The cache file also carries a small health marker
+   (consecutive failing PT days, notices already sent) used by pending_notice().
 
 Returns {"value", "as_of", "source": "factset", "pe", "price", "url"} or raises FetchError.
 """
@@ -30,7 +33,7 @@ import io
 import json
 import logging
 import re
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -55,6 +58,10 @@ MAX_JUMP = 0.08          # |EPS - last good| / last good
 OVERRIDE_CONFIRM = 0.02  # a value within 2 percent of the owner's override is accepted regardless of jump
 _MAX_PAGES = 20
 _MAX_PDF_BYTES = 40 * 1024 * 1024
+CACHE_REUSE_AFTER = time(13, 0)   # PT: reuse a same-day cache only if fetched after this
+RECHECK_AS_OF_DAYS = 6            # re-check regardless once the cached report is this old
+NOTICE_FAIL_DAYS = 2              # Telegram info after this many consecutive failing PT days
+NOTICE_STALE_DAYS = 10            # ... or when as_of is older than this
 
 _HEADERS = {
     "User-Agent": (
@@ -89,50 +96,153 @@ def _pt_today() -> date:
     return datetime.now(PT).date()
 
 
-def _load_cache() -> Optional[dict]:
+_HEALTH_KEYS = ("fail_days", "last_fail_date", "notified")
+
+
+def _read_raw() -> dict:
     try:
         with open(_FACTSET_CACHE, encoding="utf-8") as fh:
             data = json.load(fh)
-        if isinstance(data, dict) and "value" in data and "as_of" in data:
-            return data
+        return data if isinstance(data, dict) else {}
     except Exception:
-        pass
+        return {}
+
+
+def _write_raw(payload: dict) -> None:
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_FACTSET_CACHE, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+def _load_cache() -> Optional[dict]:
+    data = _read_raw()
+    if "value" in data and "as_of" in data:
+        return data
     return None
 
 
 def _save_cache(result: dict, today: date) -> None:
+    raw = _read_raw()
     payload = dict(result)
+    # A success clears the failure streak; notice markers are kept (cleared by pending_notice).
+    payload["fail_days"] = 0
+    payload["last_fail_date"] = None
+    payload["notified"] = raw.get("notified") if isinstance(raw.get("notified"), dict) else {}
     payload["fetched_at"] = datetime.now(PT).isoformat(timespec="seconds")
     payload["fetched_pt_date"] = today.isoformat()
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(_FACTSET_CACHE, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, indent=2)
+    _write_raw(payload)
     log.info("[factset_eps] Cached: $%.2f as_of=%s", result["value"], result["as_of"])
+
+
+def _record_failure(today: date) -> None:
+    """Count one failing PT day (several failures on one day count once)."""
+    try:
+        raw = _read_raw()
+        if raw.get("last_fail_date") != today.isoformat():
+            raw["fail_days"] = int(raw.get("fail_days") or 0) + 1
+            raw["last_fail_date"] = today.isoformat()
+            _write_raw(raw)
+    except Exception as exc:  # pragma: no cover
+        log.warning("[factset_eps] could not record failure marker: %s", exc)
+
+
+def _cache_reusable(cached: dict, today: date) -> bool:
+    """Same PT day, fetched at/after 13:00 PT, and the report is not 6+ days old."""
+    if cached.get("fetched_pt_date") != today.isoformat():
+        return False
+    try:
+        fetched = datetime.fromisoformat(str(cached.get("fetched_at")))
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=PT)
+        if fetched.astimezone(PT).time() < CACHE_REUSE_AFTER:
+            return False
+        as_of = date.fromisoformat(str(cached.get("as_of"))[:10])
+    except (TypeError, ValueError):
+        return False
+    return (today - as_of).days < RECHECK_AS_OF_DAYS
+
+
+def pending_notice(today: Optional[date] = None) -> Optional[str]:
+    """
+    Return a one-time informational message when FactSet has failed on 2 consecutive
+    PT days or the cached as_of is more than 10 days old, else None. Each condition
+    is reported once (marker in the cache JSON) and re-arms when the condition clears.
+    """
+    today = today or _pt_today()
+    raw = _read_raw()
+    if not raw:
+        return None
+    notified = raw.get("notified") if isinstance(raw.get("notified"), dict) else {}
+    msgs = []
+    failing = int(raw.get("fail_days") or 0) >= NOTICE_FAIL_DAYS
+    stale_days = None
+    try:
+        stale_days = (today - date.fromisoformat(str(raw.get("as_of"))[:10])).days
+    except (TypeError, ValueError):
+        pass
+    stale = stale_days is not None and stale_days > NOTICE_STALE_DAYS
+    for name, active, text in (
+        ("failing", failing,
+         f"FactSet forward EPS fetch has failed on {int(raw.get('fail_days') or 0)} consecutive days"),
+        ("stale", stale,
+         f"FactSet forward EPS report is {stale_days} days old (as of {raw.get('as_of')})"),
+    ):
+        if active and not notified.get(name):
+            msgs.append(text)
+            notified[name] = True
+        elif not active:
+            notified.pop(name, None)
+    if notified != (raw.get("notified") if isinstance(raw.get("notified"), dict) else {}):
+        raw["notified"] = notified
+        try:
+            _write_raw(raw)
+        except Exception as exc:  # pragma: no cover
+            log.warning("[factset_eps] could not write notice marker: %s", exc)
+    if not msgs:
+        return None
+    return "\u2139\ufe0f PEC: " + "; ".join(msgs) + ". Check docs/runbook.md (EPS) or update the override.\n"
 
 
 # ---------------------------------------------------------------------------
 # Download and parse
 # ---------------------------------------------------------------------------
 def _download_latest() -> tuple[bytes, str]:
-    """Follow the earningsinsight redirect; return (pdf_bytes, final_url)."""
+    """Follow the earningsinsight redirect; return (pdf_bytes, final_url). Body size is capped while streaming."""
     try:
-        resp = requests.get(FACTSET_PDF_URL, headers=_HEADERS, timeout=60, allow_redirects=True)
+        resp = requests.get(FACTSET_PDF_URL, headers=_HEADERS, timeout=60,
+                            allow_redirects=True, stream=True)
     except requests.RequestException as exc:
         raise FetchError(f"FactSet download failed: {type(exc).__name__}: {exc}") from exc
-    if resp.status_code != 200:
-        raise FetchError(f"FactSet download returned HTTP {resp.status_code} at {resp.url}")
-    ctype = resp.headers.get("Content-Type", "").lower()
-    body = resp.content
-    if body[:4] != b"%PDF":
-        raise FetchError(
-            f"FactSet URL did not return a PDF (content-type {ctype!r}, "
-            f"first bytes {body[:8]!r}, final url {resp.url})"
-        )
-    if "pdf" not in ctype and "octet-stream" not in ctype:
-        raise FetchError(f"FactSet response has unexpected content-type {ctype!r} at {resp.url}")
-    if len(body) > _MAX_PDF_BYTES:
-        raise FetchError(f"FactSet PDF unexpectedly large ({len(body)} bytes)")
-    return body, resp.url
+    try:
+        if resp.status_code != 200:
+            raise FetchError(f"FactSet download returned HTTP {resp.status_code} at {resp.url}")
+        ctype = resp.headers.get("Content-Type", "").lower()
+        declared = resp.headers.get("Content-Length", "")
+        if declared.isdigit() and int(declared) > _MAX_PDF_BYTES:
+            raise FetchError(f"FactSet PDF unexpectedly large (Content-Length {declared})")
+        chunks: list = []
+        total = 0
+        try:
+            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > _MAX_PDF_BYTES:
+                    raise FetchError(f"FactSet PDF unexpectedly large (over {_MAX_PDF_BYTES} bytes)")
+                chunks.append(chunk)
+        except requests.RequestException as exc:
+            raise FetchError(f"FactSet download failed: {type(exc).__name__}: {exc}") from exc
+        body = b"".join(chunks)
+        if body[:4] != b"%PDF":
+            raise FetchError(
+                f"FactSet URL did not return a PDF (content-type {ctype!r}, "
+                f"first bytes {body[:8]!r}, final url {resp.url})"
+            )
+        if "pdf" not in ctype and "octet-stream" not in ctype:
+            raise FetchError(f"FactSet response has unexpected content-type {ctype!r} at {resp.url}")
+        return body, resp.url
+    finally:
+        resp.close()
 
 
 def _extract_text(pdf_bytes: bytes) -> str:
@@ -234,21 +344,27 @@ def fetch_forward_eps(
     """
     Return {"value","as_of","source":"factset","pe","price","url"} or raise FetchError.
 
-    A cached result fetched on today's Pacific date is returned without a network call.
+    A cached result is returned without a network call only if it was fetched today (PT)
+    at or after 13:00 PT and its as_of is under 6 days old; otherwise FactSet is re-checked.
+    A failed check is counted (one per PT day) for pending_notice() and re-raised.
     """
     today = _pt_today()
     if use_cache:
         cached = _load_cache()
-        if cached and cached.get("fetched_pt_date") == today.isoformat():
+        if cached and _cache_reusable(cached, today):
             log.info("[factset_eps] Reusing today's cached result: $%.2f as_of=%s",
                      cached["value"], cached["as_of"])
             return {k: cached.get(k) for k in ("value", "as_of", "source", "pe", "price", "url")}
 
     log.info("[factset_eps] Fetching latest FactSet Earnings Insight PDF")
-    pdf_bytes, final_url = _download_latest()
-    log.info("[factset_eps] Final URL: %s (%d bytes)", final_url, len(pdf_bytes))
-    parsed = parse_report(_extract_text(pdf_bytes), final_url)
-    _check_jump(parsed["value"], last_good, override)
+    try:
+        pdf_bytes, final_url = _download_latest()
+        log.info("[factset_eps] Final URL: %s (%d bytes)", final_url, len(pdf_bytes))
+        parsed = parse_report(_extract_text(pdf_bytes), final_url)
+        _check_jump(parsed["value"], last_good, override)
+    except Exception:
+        _record_failure(today)
+        raise
 
     result = {
         "value": parsed["value"],

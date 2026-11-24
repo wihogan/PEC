@@ -498,16 +498,16 @@ valuation_inputs:
       value:    419.64
       effective_date: "2026-11-20"
     notes: >
-      NTM (next-twelve-months) consensus forward operating EPS for the S&P 500.
-      Update manually each week after markets close Friday.
-      Use the 52-Week Forward EPS line — NOT the calendar-year or GAAP EPS figures.
-
-      Primary source:
-        Yardeni Research — 52-Wk Forward EPS chart
+      NTM (next-twelve-months) forward operating EPS for the S&P 500.
+      Automated: with PEC_EPS_MODE=factset (the CI default) the FactSet Earnings Insight
+      PDF is read on each run and EPS is derived as the S&P 500 closing price divided by
+      the printed forward 12-month P/E. That value is used when the report date is newer
+      than manual_override.effective_date; otherwise (or if FactSet is unavailable and no
+      newer FactSet value was carried forward) manual_override applies.
+      Update manual_override only as a fallback or to correct a bad value:
+        python tools/set_eps.py --value <EPS> --date <YYYY-MM-DD>
+      (or the refresh workflow's eps_value / eps_date inputs). Use the 52-week forward
+      (NTM) operating EPS, not calendar-year or GAAP figures.
+      Fallback reference: Yardeni 52-Wk Forward EPS chart
         https://www.yardeni.com/charts/us-stock-market/stock-market-forward-metrics/sp-500-forward-revenues-earnings-margins
-
-      Cross-check:
-        FactSet Earnings Insight PDF — bottom-up EPS table (p. 32+)
-        https://www.factset.com/earningsinsight
-        NOTE: FactSet PDF reports CY GAAP EPS (~$268-331 range), which is 20-30% lower
-        than NTM operating EPS. Use for directional cross-check only, not as the value.
+      Source report: https://www.factset.com/earningsinsight (see docs/eps-sources.md).
