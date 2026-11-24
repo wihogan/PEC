@@ -1,0 +1,53 @@
+name: diag-multpl
+# Temporary diagnostic for multpl.com "Connection refused" (remove after investigation).
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -q -r requirements.txt
+      - name: Network facts
+        run: |
+          set +e
+          echo "== runner egress IP"; curl -s -m 10 https://api.ipify.org; echo
+          echo "== runner region"; curl -s -m 10 -H Metadata:true "http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text"; echo
+          for h in www.multpl.com multpl.com; do
+            echo "== DNS $h"; dig +short A $h; dig +short AAAA $h; dig +short CNAME $h
+          done
+          echo "== resolver view"; getent ahosts www.multpl.com
+      - name: TCP and HTTP probes (x3, 20s apart)
+        run: |
+          set +e
+          UA="$(python -c 'import fetchers.multpl as m; print(m._HEADERS["User-Agent"])')"
+          for i in 1 2 3; do
+            echo "######## attempt $i $(date -u +%H:%M:%S)"
+            for ip in $(dig +short A www.multpl.com | grep -E '^[0-9.]+$'); do
+              echo "-- tcp 443 $ip"; timeout 8 bash -c "</dev/tcp/$ip/443" && echo open || echo "closed/refused rc=$?"
+              echo "-- tcp 80 $ip";  timeout 8 bash -c "</dev/tcp/$ip/80"  && echo open || echo "closed/refused rc=$?"
+            done
+            for u in https://www.multpl.com/shiller-pe/table/by-month https://multpl.com/ http://www.multpl.com/; do
+              echo "-- curl -4 $u"; curl -4 -sS -o /dev/null -m 20 -A "$UA" -w 'http=%{http_code} ip=%{remote_ip} t=%{time_total}\n' "$u"
+            done
+            echo "-- curl -6"; curl -6 -sS -o /dev/null -m 20 -A "$UA" -w 'http=%{http_code} ip=%{remote_ip}\n' https://www.multpl.com/ 
+            echo "-- control host"; curl -sS -o /dev/null -m 20 -w 'http=%{http_code} ip=%{remote_ip}\n' https://fred.stlouisfed.org/
+            echo "-- python fetcher (same code path as refresh)"
+            python - <<'PY'
+          import fetchers.multpl as m
+          try:
+              html = m._download("shiller-pe", "shiller_pe")
+              print("python ok, bytes", len(html))
+          except Exception as e:
+              print("python FAIL:", repr(e)[:300])
+          PY
+            sleep 20
+          done
+          echo "== verbose TLS handshake"; curl -4 -v -sS -o /dev/null -m 20 -A "$UA" https://www.multpl.com/ 2>&1 | grep -E "Trying|Connected|connect to|SSL connection|subject|issuer|HTTP/|server:|cf-|x-" | head -30
