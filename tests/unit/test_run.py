@@ -20,14 +20,14 @@ NOW_TS = "2026-11-20T14:17:00"
 
 CONFIG = {
     "series": [
-        {"id": "sp500", "source": "yahoo", "series_id": "^GSPC", "label": "S&P", "refresh_frequency": "market_daily"},
-        {"id": "treasury_10yr", "source": "fred", "series_id": "DGS10", "label": "10y", "refresh_frequency": "market_daily"},
+        {"id": "sp500", "source": "yahoo", "series_id": "^GSPC", "label": "S&P", "refresh_frequency": "intraday"},
+        {"id": "treasury_10yr", "source": "fred", "series_id": "DGS10", "label": "10y", "refresh_frequency": "daily_release"},
         {"id": "cpi_yoy", "source": "fred", "series_id": "CPIAUCSL", "label": "CPI", "refresh_frequency": "monthly", "yoy_pct": True},
         {"id": "gdp_growth", "source": "fred", "series_id": "GDPX", "label": "GDP", "refresh_frequency": "quarterly"},
-        {"id": "dow_jones", "source": "yahoo", "series_id": "^BOGUS", "label": "Dow", "refresh_frequency": "market_daily"},
-        {"id": "brand_new", "source": "yahoo", "series_id": "^FAIL", "label": "New", "refresh_frequency": "market_daily"},
+        {"id": "dow_jones", "source": "yahoo", "series_id": "^BOGUS", "label": "Dow", "refresh_frequency": "intraday"},
+        {"id": "brand_new", "source": "yahoo", "series_id": "^FAIL", "label": "New", "refresh_frequency": "intraday"},
         {"id": "nber_recession", "source": "fred", "series_id": "USREC", "label": "NBER", "refresh_frequency": "monthly"},
-        {"id": "yield_curve", "source": "treasury", "series_id": "daily_treasury_yield_curve", "label": "YC", "refresh_frequency": "daily_once"},
+        {"id": "yield_curve", "source": "treasury", "series_id": "daily_treasury_yield_curve", "label": "YC", "refresh_frequency": "daily_release", "publish_lag_bd": 0},
     ],
     "valuation_inputs": {
         "forward_eps_ntm": {
@@ -45,18 +45,18 @@ PRIOR = {
         "statuses": {
             "sp500": {"status": "ok", "last_fetched": "2026-11-19T14:17:00"},
             "treasury_10yr": {"status": "ok", "last_fetched": "2026-11-19T14:17:00"},
-            "cpi_yoy": {"status": "ok", "last_fetched": "2026-11-02T14:17:00"},        # current month -> skip
-            "gdp_growth": {"status": "ok", "last_fetched": "2026-10-01T14:17:00"},     # current quarter -> skip
+            "cpi_yoy": {"status": "ok", "last_fetched": "2026-11-02T14:17:00"},        # Oct obs present -> skip
+            "gdp_growth": {"status": "ok", "last_fetched": "2026-10-01T14:17:00"},     # Q3 obs present -> skip
             "dow_jones": {"status": "ok", "last_fetched": "2026-11-19T14:17:00"},
-            "nber_recession": {"status": "ok", "last_fetched": "2026-11-02T14:17:00"},  # current, but no data
+            "nber_recession": {"status": "ok", "last_fetched": "2026-11-02T14:17:00"},  # no data -> due (throttle: not today)
             "yield_curve": {"status": "ok", "last_fetched": "2026-11-19T14:17:00"},
         },
     },
     "series": {
         "sp500": {"dates": ["2026-11-19"], "values": [6800.0]},
-        "treasury_10yr": {"dates": ["2026-11-19"], "values": [4.1]},
-        "cpi_yoy": {"dates": ["2026-09-01"], "values": [2.9]},
-        "gdp_growth": {"dates": ["2026-04-01"], "values": [2.1]},
+        "treasury_10yr": {"dates": ["2026-11-18"], "values": [4.1]},   # lag 1 expects Thu 19 -> due
+        "cpi_yoy": {"dates": ["2026-10-01"], "values": [2.9]},
+        "gdp_growth": {"dates": ["2026-07-01"], "values": [2.1]},
         "dow_jones": {"dates": ["2026-11-19"], "values": [44000.0]},
         "yield_curve": {"dates": ["2026-11-19"], "tenors": {"10yr": [4.1]}},
     },
@@ -170,7 +170,7 @@ def test_run_does_not_call_fetchers_for_skipped_series(env):
     refresh_v2.run()
     fetched = [kw["series_id"] for src, kw in env.calls if src in ("yahoo", "fred")]
     assert "CPIAUCSL" not in fetched and "GDPX" not in fetched
-    # "current" per frequency but absent from prior series -> fetched anyway
+    # monthly with no stored data and not fetched today -> fetched
     assert "USREC" in fetched
 
 
@@ -384,3 +384,30 @@ def test_fetch_valuation_inputs_direct_override_only(monkeypatch):
     }
     assert calls == [{"history": True}]
     assert statuses == {"forward_eps_ntm": {"status": "ok"}}
+
+
+def test_run_passes_last_obs_and_publish_lag(env, monkeypatch):
+    seen = {}
+    real = refresh_v2._needs_refresh
+
+    def spy(sid, frequency, existing_statuses, last_obs=None, publish_lag_bd=0, now=None):
+        seen[sid] = (frequency, last_obs, publish_lag_bd)
+        return real(sid, frequency, existing_statuses, last_obs=last_obs, publish_lag_bd=publish_lag_bd, now=now)
+
+    monkeypatch.setattr(refresh_v2, "_needs_refresh", spy)
+    refresh_v2.run()
+    from datetime import date
+    assert seen["treasury_10yr"] == ("daily_release", date(2026, 11, 18), 1)   # FRED default lag 1
+    assert seen["yield_curve"] == ("daily_release", date(2026, 11, 19), 0)     # explicit 0
+    assert seen["sp500"] == ("intraday", date(2026, 11, 19), 0)
+    assert seen["cpi_yoy"] == ("monthly", date(2026, 10, 1), 0)
+    assert seen["nber_recession"] == ("monthly", None, 0)
+
+
+def test_run_last_fetched_is_pt_regardless_of_process_tz(env, monkeypatch):
+    from conftest import set_tz
+    with set_tz("UTC"):
+        refresh_v2.run()
+    out = _out()
+    assert out["metadata"]["last_refreshed"] == NOW_TS          # 14:17 PT, not 22:17 UTC
+    assert out["metadata"]["statuses"]["sp500"]["last_fetched"] == NOW_TS

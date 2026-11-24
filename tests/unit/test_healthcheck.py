@@ -281,12 +281,12 @@ def test_rule3_html_missing(pass_files, tmp_path):
 # ---------------------------------------------------------------------------
 # Rule 4
 # ---------------------------------------------------------------------------
-MD_MIXED = ["dow_jones", "nasdaq", "fed_funds", "gold_spot"]   # yahoo + fred, all market_daily
+MD_MIXED = ["dow_jones", "nasdaq", "fed_funds", "gold_spot"]   # yahoo intraday + fred daily_release
 
 
 def test_rule4_fixture_assumptions():
     for sid in MD_MIXED:
-        assert FREQ[sid] == "market_daily"
+        assert FREQ[sid] in healthcheck.DAILY_FREQUENCIES
     assert {SOURCE[s] for s in MD_MIXED} == {"yahoo", "fred"}
 
 
@@ -375,8 +375,10 @@ def test_rule4_attempted_definition(mutated):
 @pytest.mark.parametrize(
     "sid, ok_age, bad_age",
     [
-        ("sp500", 7, 8),            # market_daily 7
-        ("treasury_10yr", 7, 8),    # FRED daily, market_daily
+        ("sp500", 7, 8),            # intraday 7
+        ("btc_usd", 7, 8),          # intraday (crypto)
+        ("treasury_10yr", 7, 8),    # daily_release 7
+        ("tips_5yr", 7, 8),
         ("eur_usd", 14, 15),        # FRED FX 14 (NB2)
         ("cad_usd", 14, 15),
         ("jpy_usd", 14, 15),
@@ -432,7 +434,8 @@ def test_rule5_slow_series_never_fail(mutated):
         set_last_obs(d, "sp500_earnings", days_ago(400))
     r = check(mutated(fn))
     assert r["failures"] == []
-    assert len([w for w in r["warnings"] if "days old (warn >" in w and "forward_eps" not in w and "fwd_pe" not in w]) == 3
+    warned = {w.split()[0] for w in r["warnings"] if "days old (warn >" in w}
+    assert {"cpi_yoy", "gdp_growth", "sp500_earnings"} <= warned
 
 
 # ---------------------------------------------------------------------------
@@ -541,3 +544,52 @@ def test_cli_missing_data_still_writes_report(pass_files, tmp_path):
                            "--config", str(REAL_CONFIG), "--out", str(out), "--now", "2026-11-20T15:00:00"])
     assert rc == 1
     assert json.loads(out.read_text())["failures"][0].startswith("rule 1")
+
+
+# ---------------------------------------------------------------------------
+# Amendment B mapping
+# ---------------------------------------------------------------------------
+def test_daily_frequencies_constant():
+    assert healthcheck.DAILY_FREQUENCIES == ("intraday", "daily_release")
+    assert set(healthcheck.THRESHOLDS["fail_by_frequency"]) == {"intraday", "daily_release"}
+
+
+def test_rule4_counts_daily_release_and_intraday_not_after_close(mutated):
+    """4 failures among intraday+daily_release fail; multpl (daily_after_close) never counts."""
+    def fn(d):
+        for sid in ["fed_funds", "treasury_10yr", "dow_jones", "sp500_pe", "shiller_cape"]:
+            set_status(d, sid, "error")
+    assert check(mutated(fn))["failures"] == []      # only 3 daily-type failures
+
+    def fn4(d):
+        fn(d)
+        set_status(d, "hy_yield", "error")
+    r = check(mutated(fn4))
+    assert rules(r) == ["rule 4"] and "4 market_daily series failed" in r["failures"][0]
+
+
+@pytest.mark.parametrize("sid", ["sp500_pe", "shiller_cape", "sp500_dividend_yield", "sp500_earnings_yield"])
+def test_daily_after_close_warn_only_after_7_days(mutated, sid):
+    r = check(mutated(lambda d: set_last_obs(d, sid, days_ago(7))))
+    assert not [w for w in r["warnings"] if w.startswith(f"{sid} last observation")]
+    r = check(mutated(lambda d: set_last_obs(d, sid, days_ago(400))))
+    assert r["failures"] == []
+    assert f"{sid} last observation is 400 days old (warn > 7)" in r["warnings"]
+
+
+def test_sp500_earnings_keeps_220_day_warning(mutated):
+    r = check(mutated(lambda d: set_last_obs(d, "sp500_earnings", days_ago(100))))
+    assert not [w for w in r["warnings"] if w.startswith("sp500_earnings last observation")]
+
+
+# ---------------------------------------------------------------------------
+# Negative age (crypto bars dated in UTC, docs/spike.md follow-up)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("sid", ["btc_usd", "eth_usd", "xrp_usd"])
+def test_negative_age_passes(mutated, sid):
+    tomorrow = TODAY + timedelta(days=1)
+    r = check(mutated(lambda d: set_last_obs(d, sid, tomorrow, value=90000.0)))
+    assert r["failures"] == []
+    assert r["series"][sid]["age_days"] == -1
+    assert r["series"][sid]["last_obs"] == tomorrow.isoformat()
+    assert not [w for w in r["warnings"] if w.startswith(sid)]
