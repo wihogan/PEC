@@ -39,10 +39,13 @@ def test_edit_changes_exactly_two_lines_and_preserves_everything_else(cfg):
     a, b = before.decode().splitlines(keepends=True), after.decode().splitlines(keepends=True)
     assert len(a) == len(b)
     changed = [(x, y) for x, y in zip(a, b) if x != y]
-    assert changed == [
-        ("      value:    354.84\n", "      value:    360.12\n"),
-        ('      effective_date: "2026-05-07"\n', '      effective_date: "2026-11-20"\n'),
+    # The live override value/date change whenever the owner updates EPS; derive them.
+    ov = refresh_v2._load_config(REAL_CONFIG)["valuation_inputs"]["forward_eps_ntm"]["manual_override"]
+    expected = [
+        (f"      value:    {ov['value']}\n", "      value:    360.12\n"),
+        (f'      effective_date: "{ov["effective_date"]}"\n', '      effective_date: "2026-11-20"\n'),
     ]
+    assert changed == [pair for pair in expected if pair[0] != pair[1]]
     # all comments retained byte-for-byte
     assert [l for l in a if l.lstrip().startswith("#")] == [l for l in b if l.lstrip().startswith("#")]
     assert _override(cfg) == {"value": 360.12, "effective_date": "2026-11-20"}
