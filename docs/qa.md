@@ -240,3 +240,103 @@ Side effects of my runs: one `[TEST] ⚠️ PEC refresh FAILED` Telegram message
     Amendment B re-run results (section 8) to `docs/test-report.md`.
 14. After merge: owner runs `git pull && bash mac/install.sh`, checks `plutil -p
     ~/Library/LaunchAgents/com.pec.trigger.plist` shows hours 6–9 correctly, then the 5-day run and UAT start.
+
+---
+
+## Re-check (2026-11-24)
+
+Reviewer: same independent QA agent. Time: 10:50–11:10 PT (NYSE open). Ref: `amendment-b` @ fa95fa9
+(fixes 8b7830a, 25c1630, tests 4769818, D4–D6 fa95fa9). `main` is now 9082e5c (one docs-only commit);
+a trial merge of the branch into it is clean. Production `state` was 3aa2900 before and after.
+
+### Verdict: MERGE
+
+All five majors are fixed in code and covered by tests. No regression was found. Four follow-ups
+(R1–R4 below) are small and do not need to hold the merge.
+
+### Not done
+- **Guard proof by live dispatch.** The one permitted run on `ref=amendment-b` with
+  `state_ref=state` was blocked by this session's permission system, so I did not dispatch it. In
+  its place I extracted the "Normalise inputs" script from `refresh.yml` and ran it locally with
+  the same environment variables (results under m1/m2). This proves the script, not the GitHub wiring.
+- **M2 post-close behaviour live.** The market was open during the re-check, so every intraday
+  series was fetched on every run. The post-close rule was checked by direct calls only.
+- **Production branch of the alert decision** (`refresh.yml:350-366`) and the "recovered" message
+  run only for `state_ref=state`; they could not be exercised from `state-test`.
+
+### Majors
+
+| # | Status | Evidence |
+|---|---|---|
+| M1 | RESOLVED | `refresh_v2.py:735-745`: an errored monthly/quarterly series is due again, once per PT day, throttled on `last_attempt`. `refresh_v2.py:1031,1045`: every attempt stamps `last_attempt`. `healthcheck.py:229-234`: `attempted()` requires the stamp to equal `last_refreshed`. My original reproduction now gives "due next day: True" and `ok True []`. Live: 42 of 42 status records carry `last_attempt` (state-test 2e7233a). |
+| M2 | RESOLVED, one residual (R1) | `refresh_v2.py:712-722`: exchange-traded intraday series are satisfied after the close only when `last_obs >= last completed trading day`; re-fetch until 18:00 PT that day; crypto keeps the fetch-time rule (`refresh_v2.py:629-633`). Direct calls for a bar missing after a 13:20 fetch: due at 14:17, 15:50, 17:59; not due at 18:00 or next day 05:00; due at 06:45. `daily_after_close` keeps the fetch-time rule: ACCEPTED-DEVIATION (multpl row dates do not follow trading days). |
+| M3 | RESOLVED | `mac/pec-watchdog.sh:50-60`: success must be created at or after 13:00 PT; `--branch main --limit 50`. Static review only. Takes effect after the owner re-runs `mac/install.sh`. |
+| M4 | RESOLVED, two notes (R2, R3) | `refresh.yml:332`: cancelled runs no longer alert. `refresh.yml:350-366`: production alerts only for the first failed run of the PT day or runs started 13:00–16:30 PT; `[TEST]` always. `refresh.yml:268-283`: "recovered" message. `tools/pec_runs.sh` run read-only against the repo returned `success` / `0`, which matches the run list. Worst case is now about 5 alerts a day (first morning failure plus four post-close slots) instead of 11. |
+| M5 | RESOLVED | `fetchers/factset_eps.py:150-164`: cache reused only if fetched today at or after 13:00 PT and `as_of` under 6 days old. `factset_eps.py:167-207` with `refresh_v2.py:321-339`: one notice after 2 failing PT days or `as_of` over 10 days old, sent after the state save. `refresh_v2.py:547-549`: a FactSet error is recorded under `forward_eps_ntm`. Live: both morning runs re-fetched the PDF; the cache file carries `fail_days`, `last_fail_date`, `notified`. |
+
+### Minors and nits
+
+| # | Status | Evidence |
+|---|---|---|
+| m1 | RESOLVED (script-level proof) | `refresh.yml:100-102`. Local run of the script with `GIT_REF=refs/heads/amendment-b`, `state_ref=state`: `::error::state_ref=state must run from main`, exit 1, no outputs written. It is step 1, before checkout and restore. |
+| m2 | RESOLVED | `refresh.yml:103-106`. Live run 45465426488 was dispatched with `deploy=true`: "forcing deploy=false (test state is never published)"; deploy job skipped. |
+| m3 | RESOLVED (owner decision) | `refresh_v2.py:742-743`: weekly re-check once the period is present. Old-state record without `last_attempt`: not due on 11-25, due on 11-30. |
+| m4 | RESOLVED | `checkout@v7`, `setup-python@v7`, `upload-artifact@v7`, `download-artifact@v8`, `upload-pages-artifact@v5`, `deploy-pages@v5`. All but the two Pages actions ran live with no Node warning; the Pages actions run only from `main`. |
+| m5 | RESOLVED | `healthcheck.py:332-339`. |
+| m6 | RESOLVED | `refresh.yml:223,291-304`. Live: `leak_scan: OK (4 file(s) scanned)`; upload only after the scan. |
+| m7, m8, m9 | RESOLVED | `mac/install.sh:30-36,146,163-168`; `mac/README.md` item 6. Static only. |
+| m10 | RESOLVED | `refresh_v2.py:304-305`; notify step now after "Save state" (`refresh.yml:225-241`). No "X → X" line in either live log. |
+| m11 | RESOLVED | `refresh_v2.py:498-505`; `fetchers/spglobal.py:296-318`. Live: history written with the override in effect. |
+| m12 | RESOLVED | `refresh_v2.py:616-624`; a garbage stamp is now "due". |
+| m13 | NOT RESOLVED (accepted) | `yield_curve` fetch is unchanged; it fits the timeout. |
+| m14 | RESOLVED | `ci.yml:4`; CI ran on the branch (run 45463900027, success). |
+| Nits | PARTIAL | Fixed: config notes, `diag-multpl.yml` removed, docstring, runbook §8, requirements comment, streamed size cap, naive `now`, D2 dropped. Not fixed: console banner (`refresh_v2.py:1159-1166`) still says "needs a weekly manual update". |
+
+### New observations from the fixes
+
+- **R1 (minor, residual of M2).** The data-based re-fetch runs until 18:00 PT, but the last trigger
+  is 15:50 PT. On 2026-11-23 the ETF bar arrived between 17:42 and 18:25 PT, so with that delay all
+  four post-close runs would still miss it. Whether that delay is normal is unknown.
+- **R2 (minor, new silent path, unverified).** `refresh.yml:332` drops alerts for cancelled jobs. I
+  believe a job that exceeds `timeout-minutes: 25` ends as `cancelled`, not `failure`; I could not
+  test this. If so, a hung fetch (the Yahoo fetcher has no timeout) no longer alerts; only the
+  16:30 watchdog would catch it.
+- **R3 (minor).** `failures-today` counts every earlier failure of the day. A failure, a recovery,
+  then a second failure before 13:00 PT is suppressed until the 13:20 run.
+- **R4 (nit).** `docs/runbook.md` §2 does not list the new messages ("PEC recovered", the two
+  FactSet notices) or the once-a-day alert rule.
+- `state-test` only: its history file still has one entry dated 2026-11-30, written by the old code
+  during my first review. Production has no history file, so it is not affected.
+
+### Suite
+972 passed, 4 deselected, 0 xfailed (local, `TZ` unset and `TZ=UTC`; same count on the runner).
+
+### Live runs (`ref=amendment-b`, `state-test`)
+| Run | Inputs | Result | What it showed |
+|---|---|---|---|
+| 45463955888 | force=true | success | 36/41, 5 multpl failed, `RESULT: OK`; FactSet fetched (`EarningsInsight_112026A.pdf`, 419.64, as of 11-20), override wins; history 71 entries; `last_attempt` on all 42 records; 4-file leak scan; notify skipped; no Node warnings. |
+| 45465426488 | force=false, deploy=true | success | deploy forced to false; `15/20 fetched | 21 skipped`: 14 intraday (market open) and `wti_crude` fetched, 5 multpl retried; FactSet re-fetched (before 13:00 PT); no EPS message; "Recovery notice" skipped on test state. |
+| 45465868564 | inject=stale_state | failure (expected) | `rule 5: dow_jones … 30 days old`; state not saved; notify: `alert decision: send=true (test run)`, artifact downloaded with `download-artifact@v8`, `sent (HTTP 200)`. |
+
+Side effects: one `[TEST] ⚠️ PEC refresh FAILED` message (run 45465868564); `state-test` is now 5a1c52c.
+
+### Merge readiness
+- **First production run after merge** (simulated on `state` 3aa2900): old records without
+  `last_attempt` are handled (fallback to `last_fetched`). In market hours it fetches 14 intraday,
+  retries 5 multpl, polls `wti_crude`, and fetches the 3 delinquency series once; monthly series and
+  GDP wait for the weekly re-check on 11-30. Healthcheck rule 4 ignores the carried multpl errors.
+- **EPS**: no history or FactSet cache exists on `state`; the first run builds the history from the
+  seed (with the May–Oct backfill) plus a November entry dated 2026-11-20, and saves both files.
+  Source stays `override` 419.64, so no message.
+- **One-time messages to expect**: none at merge. The first FactSet report dated after 2026-11-20
+  will send one "PEC forward EPS updated: 419.64 → …" message (source switch).
+- **No production run has happened since 18:51 PT on 11-23**, and no `schedule` or Mac-triggered
+  refresh run exists yet. The 5-day unattended run has not started.
+
+### Recommended follow-ups (after merge)
+1. Owner: `git pull && bash mac/install.sh` (hourly times and the new watchdog are not active until then).
+2. From `main`, one `inject=bad_fred_key` run on `state`, then a default run: confirms the
+   production alert decision and the "recovered" message, which no test run can reach.
+3. R2: add `timeout-minutes: 20` to the "Refresh" step so a hang fails the job instead of cancelling it.
+4. R1: add one later trigger (about 17:30 PT), or accept next-morning correction.
+5. R4 and the console banner text.

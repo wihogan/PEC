@@ -203,6 +203,7 @@ jobs:
           esac
 
       - name: Refresh
+        timeout-minutes: 18  # QA R2: a hung refresh fails the step (alerts) instead of the job being cancelled silently
         env:
           FRED_API_KEY: ${{ steps.norm.outputs.inject == 'bad_fred_key' && 'invalid' || secrets.FRED_API_KEY }}
           FORCE: ${{ steps.norm.outputs.force }}
