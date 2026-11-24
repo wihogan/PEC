@@ -34,7 +34,7 @@ def test_41_unique_series_ids(config):
 
 
 def test_registry_keys(registry):
-    assert set(registry) == {"fred", "yahoo", "treasury", "shiller", "spglobal", "multpl"}
+    assert set(registry) == {"fred", "yahoo", "treasury", "shiller", "spglobal", "multpl", "factset_eps"}
 
 
 def test_every_source_is_registered(config, registry):

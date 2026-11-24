@@ -55,11 +55,21 @@ def test_seed_loader_rounds_and_stringifies(seed):
     ]
 
 
-def test_real_seed_has_64_entries():
+BACKFILL = {  # docs/eps-backfill.md (FactSet, price / fwd 12M P/E)
+    "2026-05-31": 356.78, "2026-06-30": 366.04, "2026-07-31": 379.47,
+    "2026-08-31": 394.44, "2026-09-30": 401.26, "2026-10-31": 412.86,
+}
+
+
+def test_real_seed_has_backfill():
     spglobal._SEED_YAML.write_text(REAL_SEED.read_text(encoding="utf-8"), encoding="utf-8")
     entries = spglobal._seed_history_from_yaml()
-    assert len(entries) == 64
-    assert entries[-1]["date"] == "2026-04-30"
+    assert len(entries) >= 70
+    by_date = {e["date"]: e["value"] for e in entries}
+    for d, v in BACKFILL.items():
+        assert by_date.get(d) == v, d
+    dates = [e["date"] for e in entries]
+    assert dates == sorted(dates) and len(set(d[:7] for d in dates)) == len(dates)
 
 
 def test_history_fetch_bootstraps_from_seed_without_writing(seed):
@@ -143,3 +153,96 @@ def test_malformed_history_json_treated_as_empty(seed):
     assert spglobal._load_history_entries() == []
     df = spglobal.fetch("forward_eps_ntm", history=True)
     assert len(df) == 3  # falls back to seed
+
+
+# ---------------------------------------------------------------------------
+# record_month_end (FactSet automation)
+# ---------------------------------------------------------------------------
+def _entries():
+    return {e["date"]: e["value"] for e in _history()["entries"]}
+
+
+def test_record_month_end_bootstraps_from_seed_and_adds_month(seed):
+    assert not spglobal._HISTORY_JSON.exists()
+    assert spglobal.record_month_end(date(2026, 11, 20), 419.644) is True
+    assert _entries() == {"2026-08-31": 340.1, "2026-09-30": 345.5, "2026-10-30": 350.12, "2026-11-30": 419.64}
+    assert seed.read_text(encoding="utf-8") == SEED_TEXT        # seed never rewritten
+
+
+def test_record_month_end_existing_month_keeps_date_updates_value(seed):
+    spglobal.record_month_end(date(2026, 11, 20), 419.64)
+    assert spglobal.record_month_end(date(2026, 11, 27), 421.5) is True
+    e = _entries()
+    assert e["2026-11-30"] == 421.5 and len(e) == 4
+    # an existing irregular date key (seed's 2026-10-30) is kept as-is
+    assert spglobal.record_month_end(date(2026, 10, 30), 351.0) is True
+    assert "2026-10-30" in _entries() and "2026-10-31" not in _entries()
+
+
+def test_record_month_end_same_value_is_noop(seed):
+    spglobal.record_month_end(date(2026, 11, 20), 419.64)
+    before = spglobal._HISTORY_JSON.read_text(encoding="utf-8")
+    assert spglobal.record_month_end(date(2026, 11, 27), 419.6400001) is False
+    assert spglobal._HISTORY_JSON.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize(
+    "as_of, key",
+    [(date(2026, 10, 30), "2026-10-31"), (date(2027, 2, 26), "2027-02-28"), (date(2028, 2, 25), "2028-02-29")],
+)
+def test_record_month_end_uses_calendar_month_end(as_of, key):
+    spglobal._SEED_YAML.write_text("entries: []\n", encoding="utf-8")
+    spglobal.record_month_end(as_of, 400.0)
+    assert list(_entries()) == [key]
+
+
+def test_record_month_end_merges_new_seed_rows_on_value_change(seed):
+    spglobal._save_history_entries([{"date": "2026-08-31", "value": 340.1}, {"date": "2026-11-30", "value": 419.64}])
+    assert spglobal.record_month_end(date(2026, 11, 27), 421.0) is True
+    e = _entries()
+    assert list(e) == ["2026-08-31", "2026-09-30", "2026-10-30", "2026-11-30"]   # sorted, seed rows merged
+    assert e["2026-11-30"] == 421.0
+
+
+def test_record_month_end_cache_wins_over_seed_for_same_month(seed):
+    spglobal._save_history_entries([{"date": "2026-09-30", "value": 999.0}])
+    spglobal.record_month_end(date(2026, 11, 20), 419.64)
+    assert _entries()["2026-09-30"] == 999.0
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "spglobal.record_month_end: seed rows merged into an existing cache are only saved when the "
+        "current month's value changes (save is gated on `modified`), so new seed backfill rows do "
+        "not reach an existing history cache on runs where the FactSet value is unchanged "
+        "(docstring: 'adding backfill rows to the seed also reaches an existing cache')."
+    ),
+)
+def test_record_month_end_persists_seed_merge_when_value_unchanged(seed):
+    spglobal._save_history_entries([{"date": "2026-11-30", "value": 419.64}])
+    spglobal.record_month_end(date(2026, 11, 27), 419.64)
+    assert "2026-09-30" in _entries()
+
+
+def test_record_month_end_visible_in_history_fetch(seed):
+    spglobal.record_month_end(date(2026, 11, 20), 419.64)
+    df = spglobal.fetch("forward_eps_ntm", history=True)
+    assert df["date"].dt.strftime("%Y-%m-%d").tolist()[-1] == "2026-11-30"
+    assert df["value"].iloc[-1] == 419.64
+
+
+def test_record_month_end_never_raises(seed):
+    assert spglobal.record_month_end(date(2026, 11, 20), "not-a-number") is False
+    assert spglobal.record_month_end(None, 419.64) is False
+
+
+def test_record_month_end_with_real_seed_backfill():
+    spglobal._SEED_YAML.write_text(REAL_SEED.read_text(encoding="utf-8"), encoding="utf-8")
+    spglobal.record_month_end(date(2026, 11, 20), 419.64)
+    e = _entries()
+    for d, v in BACKFILL.items():
+        assert e[d] == v
+    assert e["2026-11-30"] == 419.64
+    seed_rows = spglobal._seed_history_from_yaml()
+    assert len(e) == len(seed_rows) + (0 if any(r["date"].startswith("2026-11") for r in seed_rows) else 1)

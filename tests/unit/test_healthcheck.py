@@ -445,7 +445,7 @@ def test_rule6_live_source_fails(mutated):
     def fn(d):
         d["valuation_inputs"]["forward_eps_ntm"]["source"] = "live"
     r = check(mutated(fn))
-    assert r["failures"] == ["rule 6: forward_eps_ntm source is 'live', expected 'override'"]
+    assert r["failures"] == ["rule 6: forward_eps_ntm source is 'live', expected 'override' or 'factset'"]
 
 
 def test_rule6_override_value_mismatch_fails(mutated):
@@ -593,3 +593,71 @@ def test_negative_age_passes(mutated, sid):
     assert r["series"][sid]["age_days"] == -1
     assert r["series"][sid]["last_obs"] == tomorrow.isoformat()
     assert not [w for w in r["warnings"] if w.startswith(sid)]
+
+
+# ---------------------------------------------------------------------------
+# Rule 6 with source 'factset' (FactSet automation)
+# ---------------------------------------------------------------------------
+OV_DATE = date.fromisoformat(str(CFG["valuation_inputs"]["forward_eps_ntm"]["manual_override"]["effective_date"]))
+
+
+def _factset(as_of, value=419.64, effective_date=None, drop_as_of=False):
+    def fn(d):
+        eps = d["valuation_inputs"]["forward_eps_ntm"]
+        eps.update(source="factset", value=value, url="https://x/EarningsInsight_112026A.pdf")
+        eps["effective_date"] = effective_date if effective_date is not None else as_of
+        if drop_as_of:
+            eps.pop("as_of", None)
+        else:
+            eps["as_of"] = as_of
+    return fn
+
+
+def test_rule6_factset_newer_than_override_passes(mutated):
+    newer = (OV_DATE + timedelta(days=1)).isoformat()
+    r = check(mutated(_factset(newer)))
+    assert r["failures"] == []
+
+
+@pytest.mark.parametrize("delta_days", [0, -7])
+def test_rule6_factset_not_newer_than_override_fails(mutated, delta_days):
+    as_of = (OV_DATE + timedelta(days=delta_days)).isoformat()
+    r = check(mutated(_factset(as_of)))
+    assert rules(r) == ["rule 6"] and "is not newer than config override effective_date" in r["failures"][0]
+
+
+@pytest.mark.parametrize("value", [199.99, 600.01, None, "abc"])
+def test_rule6_factset_value_out_of_range_fails(mutated, value):
+    newer = (OV_DATE + timedelta(days=1)).isoformat()
+    r = check(mutated(_factset(newer, value=value)))
+    assert rules(r) == ["rule 6"]
+
+
+@pytest.mark.parametrize("value", [200.0, 600.0])
+def test_rule6_factset_range_inclusive(mutated, value):
+    newer = (OV_DATE + timedelta(days=1)).isoformat()
+    assert check(mutated(_factset(newer, value=value)))["failures"] == []
+
+
+def test_rule6_factset_uses_effective_date_when_as_of_missing(mutated):
+    newer = (OV_DATE + timedelta(days=1)).isoformat()
+    assert check(mutated(_factset(None, effective_date=newer, drop_as_of=True)))["failures"] == []
+
+
+def test_rule6_factset_without_any_date_fails(mutated):
+    r = check(mutated(_factset(None, effective_date="", drop_as_of=True)))
+    assert rules(r) == ["rule 6"]
+
+
+def test_rule6_factset_value_need_not_equal_override(mutated):
+    newer = (OV_DATE + timedelta(days=1)).isoformat()
+    assert check(mutated(_factset(newer, value=555.55)))["failures"] == []
+
+
+def test_rule6_factset_age_warning_uses_as_of(mutated):
+    r = check(mutated(_factset(TODAY.isoformat())))
+    assert not [w for w in r["warnings"] if w.startswith("forward_eps_ntm effective_date")]
+    old = (TODAY - timedelta(days=46))
+    if old > OV_DATE:
+        r = check(mutated(_factset(old.isoformat())))
+        assert any("46 days old" in w for w in r["warnings"])

@@ -380,6 +380,8 @@ def test_fetch_valuation_inputs_direct_override_only(monkeypatch):
             "effective_date": "2026-05-07",
             "source": "override",
             "history": {"dates": ["2026-04-30"], "values": [346.19]},
+            "as_of": "2026-05-07",   # EPS-mode records carry as_of/url
+            "url": None,
         }
     }
     assert calls == [{"history": True}]

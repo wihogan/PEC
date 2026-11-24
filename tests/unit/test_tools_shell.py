@@ -241,3 +241,105 @@ def test_leak_scan_missing_file_fails(files):
 
 def test_leak_scan_requires_arguments(files):
     assert _scan(files).returncode == 2
+
+
+# ---------------------------------------------------------------------------
+# state.sh optional EPS files (.cache/forward_eps_ntm_history.json, .cache/factset_eps_latest.json)
+# ---------------------------------------------------------------------------
+HIST = "forward_eps_ntm_history.json"
+FSC = "factset_eps_latest.json"
+
+
+def _write_cache(repo, name, payload):
+    (repo / ".cache").mkdir(exist_ok=True)
+    (repo / ".cache" / name).write_text(json.dumps(payload))
+
+
+def _tree(repo, ref="state-test"):
+    sha = _git(repo, "ls-remote", "origin", f"refs/heads/{ref}").stdout.split()[0]
+    _git(repo, "fetch", "-q", "origin", ref)
+    return sha, sorted(_git(repo, "ls-tree", "-r", "--name-only", sha).stdout.split())
+
+
+@pytest.mark.parametrize(
+    "present, expected",
+    [
+        ((HIST, FSC), ["data_v2.json", FSC, HIST]),
+        ((HIST,), ["data_v2.json", HIST]),
+        ((FSC,), ["data_v2.json", FSC]),
+        ((), ["data_v2.json"]),
+    ],
+)
+def test_state_save_optional_files(repo, present, expected):
+    (repo / "data_v2.json").write_text('{"v": 1}')
+    for name in present:
+        _write_cache(repo, name, {"name": name})
+    _write_cache(repo, "multpl_sp500_pe.html", {"ttl": "never persisted"})   # TTL caches stay local (F4)
+    r = _sh(STATE_SH, repo, "save", "state-test")
+    assert r.returncode == 0, r.stderr
+    sha, tree = _tree(repo)
+    assert tree == sorted(expected)
+    for name in present:
+        assert json.loads(_git(repo, "show", f"{sha}:{name}").stdout) == {"name": name}
+
+
+@pytest.mark.parametrize("present", [(HIST, FSC), (HIST,), (FSC,)])
+def test_state_restore_optional_files_round_trip(repo, tmp_path, present):
+    (repo / "data_v2.json").write_text('{"v": 2}')
+    for name in present:
+        _write_cache(repo, name, {"name": name, "value": 419.64})
+    assert _sh(STATE_SH, repo, "save", "state-test").returncode == 0
+
+    fresh = _clone(tmp_path, repo, "fresh")
+    r = _sh(STATE_SH, fresh, "restore", "state-test")
+    assert r.returncode == 0, r.stderr
+    assert json.loads((fresh / "data_v2.json").read_text()) == {"v": 2}
+    for name in (HIST, FSC):
+        p = fresh / ".cache" / name
+        if name in present:
+            assert json.loads(p.read_text()) == {"name": name, "value": 419.64}
+            assert f"restored .cache/{name}" in r.stdout
+        else:
+            assert not p.exists()
+            assert f"{name} not on 'state-test' (ok)" in r.stdout
+        assert not (fresh / ".cache" / f"{name}.tmp").exists()
+
+
+def test_state_restore_branch_without_optional_files(repo, tmp_path):
+    """A state branch saved before this feature (data_v2.json only) restores cleanly."""
+    (repo / "data_v2.json").write_text('{"v": 3}')
+    assert _sh(STATE_SH, repo, "save", "state-test").returncode == 0
+    fresh = _clone(tmp_path, repo, "fresh")
+    r = _sh(STATE_SH, fresh, "restore", "state-test")
+    assert r.returncode == 0
+    assert sorted(p.name for p in (fresh / ".cache").iterdir()) == []
+
+
+def test_state_restore_keeps_stale_local_optional_file(repo, tmp_path):
+    """Documented: a local .cache file is not removed when the branch lacks it
+    (irrelevant on fresh CI runners)."""
+    (repo / "data_v2.json").write_text('{"v": 4}')
+    assert _sh(STATE_SH, repo, "save", "state-test").returncode == 0
+    fresh = _clone(tmp_path, repo, "fresh")
+    _write_cache(fresh, FSC, {"stale": True})
+    assert _sh(STATE_SH, fresh, "restore", "state-test").returncode == 0
+    assert json.loads((fresh / ".cache" / FSC).read_text()) == {"stale": True}
+
+
+def test_state_restore_absent_branch_does_not_create_optional_files(repo):
+    r = _sh(STATE_SH, repo, "restore", "state-test")
+    assert r.returncode == 0 and "::warning::" in r.stdout
+    assert not (repo / ".cache" / HIST).exists() and not (repo / ".cache" / FSC).exists()
+
+
+def test_state_optional_files_replaced_on_next_save(repo, tmp_path):
+    (repo / "data_v2.json").write_text('{"v": 5}')
+    _write_cache(repo, HIST, {"n": 1})
+    _write_cache(repo, FSC, {"n": 1})
+    assert _sh(STATE_SH, repo, "save", "state-test").returncode == 0
+    (repo / ".cache" / FSC).unlink()
+    _write_cache(repo, HIST, {"n": 2})
+    assert _sh(STATE_SH, repo, "save", "state-test").returncode == 0
+    sha, tree = _tree(repo)
+    assert tree == ["data_v2.json", HIST]                      # orphan replace: FSC dropped
+    assert json.loads(_git(repo, "show", f"{sha}:{HIST}").stdout) == {"n": 2}
