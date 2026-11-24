@@ -1,5 +1,6 @@
 #!/bin/bash
-# Install the PEC Mac jobs (launchd): refresh trigger (13:20 and 15:50 PT, Mon-Fri)
+# Install the PEC Mac jobs (launchd): refresh trigger (Mon-Fri PT: hourly at :45 06:45-12:45,
+# then 13:20 post-close final and 15:50 retry)
 # and watchdog (16:30 PT, Mon-Fri). The Mac's clock/timezone must be Pacific.
 # Usage: mac/install.sh [--dry-run] [--reset-secrets] [--test]
 #   --dry-run        print what would happen; change nothing
@@ -144,7 +145,7 @@ PL
   } > "$f"
   plutil -lint "$f" >/dev/null || { echo "plist invalid: $f" >&2; exit 1; }
 }
-write_plist com.pec.trigger pec-trigger.sh launchd-trigger "13:20 15:50"
+write_plist com.pec.trigger pec-trigger.sh launchd-trigger "06:45 07:45 08:45 09:45 10:45 11:45 12:45 13:20 15:50"
 write_plist com.pec.watchdog pec-watchdog.sh launchd-watchdog "16:30"
 
 # --- launchd ----------------------------------------------------------

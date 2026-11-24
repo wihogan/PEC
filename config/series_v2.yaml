@@ -26,16 +26,22 @@
 # start_date          Earliest observation to fetch (ISO 8601). All series default to
 #                     2010-01-01 for ~15 years of history. CPI/GDP start earlier to
 #                     provide enough history for YoY transforms before the display window.
-# refresh_frequency   Controls how often the orchestrator re-fetches this series:
-#                       market_daily — refresh whenever market is open (9:30–16:00 ET
-#                                      Mon–Fri); outside market hours, skip if prior
-#                                      business day's close is already in data.json.
-#                       daily_once   — fetch at most once per business day regardless
-#                                      of time; timestamp displayed on dashboard.
-#                       monthly      — skip if last_fetched is in the current calendar month.
-#                       quarterly    — skip if last_fetched is in the current calendar quarter.
-#                     Omit or set to market_daily to get the default behavior.
-#                     Override all frequency checks with: python refresh.py --force
+# refresh_frequency   Controls when the orchestrator re-fetches this series (Amendment B,
+#                     docs/plan.md; logic in refresh_v2._needs_refresh):
+#                       intraday          — Yahoo series. Fetch every run while the NYSE session is
+#                                           open; after the close, fetch once if not already
+#                                           fetched since the last completed close.
+#                       daily_release     — FRED daily series and yield_curve. Fetch every run while
+#                                           the stored last observation is older than the expected
+#                                           one (last completed trading day minus publish_lag_bd).
+#                       daily_after_close — multpl. Once per trading day at the first run after the
+#                                           close; retried on later runs if it failed.
+#                       monthly           — fetch (at most once per calendar day) until the most
+#                                           recently ended month's observation is present.
+#                       quarterly         — same as monthly, with calendar quarters.
+#                     Override all frequency checks with: python refresh_v2.py --force
+# publish_lag_bd      Optional (daily_release only): trading days between an observation date
+#                     and its publication. Default 1 for source fred, 0 otherwise.
 # kpi                 true → series appears in the 12 headline KPI tiles at the top of
 #                     the dashboard. Omit or set false for chart-only series.
 # yoy_pct             true → apply 12-month percent change after fetching (CPI).
@@ -59,7 +65,7 @@ series:
     label:             "S&P 500"
     category:          equity
     start_date:        "1999-01-01"  # Extended for v2 "Max" range selector (back to Jan 1999)
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
     kpi:               true
 
   - id:                dow_jones
@@ -68,7 +74,7 @@ series:
     label:             "Dow Jones"
     category:          equity
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
     kpi:               true
 
   - id:                nasdaq
@@ -77,7 +83,7 @@ series:
     label:             "NASDAQ Composite"
     category:          equity
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
     kpi:               true
 
   - id:                developed_ex_us
@@ -86,7 +92,7 @@ series:
     label:             "Developed ex-US (VEA)"
     category:          equity
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
 
   - id:                emerging_markets
     source:            yahoo
@@ -94,7 +100,7 @@ series:
     label:             "Emerging Markets (VWO)"
     category:          equity
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
 
   # v2 layout additions — Section 1 index selector and strip
   - id:                russell_2000
@@ -103,7 +109,7 @@ series:
     label:             "Russell 2000"
     category:          equity
     start_date:        "2019-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
 
   - id:                developed_ex_us_efa
     source:            yahoo
@@ -111,7 +117,7 @@ series:
     label:             "Developed ex-US (EFA)"
     category:          equity
     start_date:        "2019-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
     notes:             "MSCI EAFE proxy via iShares EFA ETF. Complements existing VEA entry."
 
   - id:                emerging_markets_eem
@@ -120,7 +126,7 @@ series:
     label:             "Emerging Markets (EEM)"
     category:          equity
     start_date:        "2019-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
     notes:             "MSCI EM proxy via iShares EEM ETF. Complements existing VWO entry."
 
   # Section 5 Valuation strip — S&P 500 valuation metrics via multpl.com.
@@ -134,7 +140,7 @@ series:
     label:             "S&P 500 Dividend Yield"
     category:          equity
     start_date:        "2010-01-01"
-    refresh_frequency: monthly
+    refresh_frequency: daily_after_close
     kpi:               true
     notes:             "TTM dividend yield as decimal (e.g. 0.0107 = 1.07%). Source: multpl.com/s-p-500-dividend-yield"
 
@@ -144,7 +150,7 @@ series:
     label:             "S&P 500 Trailing P/E"
     category:          equity
     start_date:        "1980-01-01"
-    refresh_frequency: monthly
+    refresh_frequency: daily_after_close
     notes:             "Trailing 12-month P/E ratio. Source: multpl.com/s-p-500-pe-ratio"
 
   - id:                sp500_earnings_yield
@@ -153,7 +159,7 @@ series:
     label:             "S&P 500 Earnings Yield"
     category:          equity
     start_date:        "2010-01-01"
-    refresh_frequency: monthly
+    refresh_frequency: daily_after_close
     notes:             "TTM earnings yield as decimal (e.g. 0.0317 = 3.17%). Source: multpl.com/s-p-500-earnings-yield"
 
   - id:                sp500_earnings
@@ -162,7 +168,7 @@ series:
     label:             "S&P 500 TTM Earnings"
     category:          equity
     start_date:        "2010-01-01"
-    refresh_frequency: monthly
+    refresh_frequency: daily_after_close
     notes:             "Trailing 12-month EPS ($/share). Lags ~2 quarters. Source: multpl.com/s-p-500-earnings"
 
   - id:                shiller_cape
@@ -171,7 +177,7 @@ series:
     label:             "Shiller CAPE"
     category:          equity
     start_date:        "1980-01-01"
-    refresh_frequency: monthly
+    refresh_frequency: daily_after_close
     kpi:               true
     notes:             "multpl.com/shiller-pe/table/by-month — sourced from Shiller dataset, current data. Yale ie_data.xls retired (stale after Sep 2023)."
 
@@ -186,7 +192,7 @@ series:
     label:             "Fed Funds Rate"
     category:          rates
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
     kpi:               true
 
   - id:                treasury_1mo
@@ -195,7 +201,7 @@ series:
     label:             "1-Month Treasury"
     category:          rates
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
     kpi:               true
 
   - id:                treasury_10yr
@@ -204,7 +210,7 @@ series:
     label:             "10-Year Treasury"
     category:          rates
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
     kpi:               true
 
   # v2 layout additions — Section 2 rate charts and real yield panel
@@ -214,7 +220,7 @@ series:
     label:             "2-Year Treasury"
     category:          rates
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
     kpi:               true
 
   # tips_2yr removed: FRED has no DFII2 series (Treasury stopped issuing 2yr TIPS in 2009).
@@ -226,7 +232,7 @@ series:
     label:             "5-Year TIPS"
     category:          rates
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
 
   - id:                tips_7yr
     source:            fred
@@ -234,7 +240,7 @@ series:
     label:             "7-Year TIPS"
     category:          rates
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
 
   - id:                tips_10yr
     source:            fred
@@ -242,7 +248,7 @@ series:
     label:             "10-Year TIPS"
     category:          rates
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
 
   - id:                tips_20yr
     source:            fred
@@ -250,7 +256,7 @@ series:
     label:             "20-Year TIPS"
     category:          rates
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
 
   - id:                tips_30yr
     source:            fred
@@ -258,7 +264,7 @@ series:
     label:             "30-Year TIPS"
     category:          rates
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
 
 
   # ---------------------------------------------------------------------------
@@ -266,8 +272,8 @@ series:
   # Full daily curve from Treasury Direct XML — all tenors in one call.
   # The treasury fetcher returns long-form (date, tenor, value); the orchestrator
   # writes this block to data.json as a nested object keyed by tenor.
-  # Fetched once per business day (daily_once) — the 2-3 min fetch cost does not
-  # justify re-running intraday. Timestamp is displayed on the dashboard.
+  # daily_release with publish_lag_bd 0: Treasury publishes the day's curve the
+  # same evening, so it is polled after the close until today's row arrives.
   # ---------------------------------------------------------------------------
 
   - id:                yield_curve
@@ -276,7 +282,8 @@ series:
     label:             "Treasury Yield Curve"
     category:          yield_curve
     start_date:        "2010-01-01"
-    refresh_frequency: daily_once
+    refresh_frequency: daily_release
+    publish_lag_bd:    0
     notes:             "Returns 13 tenors: 1mo 2mo 3mo 4mo 6mo 1yr 2yr 3yr 5yr 7yr 10yr 20yr 30yr"
 
   # ---------------------------------------------------------------------------
@@ -291,7 +298,7 @@ series:
     label:             "HY Effective Yield"
     category:          credit
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
     kpi:               true
     notes:             "ICE BofA US High Yield — attribution required for external use"
 
@@ -301,7 +308,7 @@ series:
     label:             "AAA Effective Yield"
     category:          credit
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
     notes:             "ICE BofA AAA — attribution required for external use"
 
   # ---------------------------------------------------------------------------
@@ -383,7 +390,7 @@ series:
     label:             "WTI Crude Oil ($/bbl)"
     category:          commodity
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
     kpi:               true
 
   - id:                gold_spot
@@ -392,7 +399,7 @@ series:
     label:             "Gold ($/oz)"
     category:          commodity
     start_date:        "2019-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
     kpi:               true
     notes:             "COMEX gold futures — cleanest free proxy for spot gold"
 
@@ -402,7 +409,7 @@ series:
     label:             "Silver ($/oz)"
     category:          commodity
     start_date:        "2019-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
     notes:             "COMEX silver futures"
 
   - id:                platinum_spot
@@ -411,7 +418,7 @@ series:
     label:             "Platinum ($/oz)"
     category:          commodity
     start_date:        "2019-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
     notes:             "NYMEX platinum futures"
 
   # ---------------------------------------------------------------------------
@@ -426,7 +433,7 @@ series:
     label:             "EUR/USD"
     category:          fx
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
     kpi:               true
 
   - id:                cad_usd
@@ -435,7 +442,7 @@ series:
     label:             "CAD/USD"
     category:          fx
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
     notes:             "CAD per USD"
 
   - id:                jpy_usd
@@ -444,7 +451,7 @@ series:
     label:             "JPY/USD"
     category:          fx
     start_date:        "2010-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: daily_release
     notes:             "JPY per USD"
 
   # Crypto — Section 3 FX/Crypto strip and chart.
@@ -454,7 +461,7 @@ series:
     label:             "Bitcoin (USD)"
     category:          fx
     start_date:        "2019-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
     notes:             "Bitcoin/USD via yfinance — includes weekends"
 
   - id:                eth_usd
@@ -463,7 +470,7 @@ series:
     label:             "Ethereum (USD)"
     category:          fx
     start_date:        "2019-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
     notes:             "Ethereum/USD via yfinance"
 
   - id:                xrp_usd
@@ -472,7 +479,7 @@ series:
     label:             "XRP (USD)"
     category:          fx
     start_date:        "2019-01-01"
-    refresh_frequency: market_daily
+    refresh_frequency: intraday
     notes:             "XRP/USD via yfinance"
 
 # =============================================================================

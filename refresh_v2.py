@@ -78,7 +78,10 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 import yaml
 
+import market_calendar
+
 ET = ZoneInfo("America/New_York")
+PT = ZoneInfo("America/Los_Angeles")
 
 # ---------------------------------------------------------------------------
 # Paths — resolved relative to this script so the file can be run from any cwd.
@@ -426,69 +429,117 @@ def _backup_data_json() -> None:
 
 
 def _market_is_open() -> bool:
-    """True if NYSE/NASDAQ regular session is currently active (9:30–16:00 ET, Mon–Fri)."""
-    now = datetime.now(ET)
-    if now.weekday() >= 5:
-        return False
-    open_  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
-    close_ = now.replace(hour=16, minute=0,  second=0, microsecond=0)
-    return open_ <= now < close_
+    """True if the NYSE regular session is active now (thin wrapper over market_calendar)."""
+    return market_calendar.market_is_open(datetime.now(ET))
 
 
 def _last_completed_business_day() -> date:
-    """Most recent weekday on which the market has already closed (ET)."""
-    now   = datetime.now(ET)
-    today = now.date()
-    close_today = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    if today.weekday() < 5 and now >= close_today:
-        return today
-    d = today - timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
+    """Most recent trading day whose close has passed (thin wrapper over market_calendar)."""
+    return market_calendar.last_completed_trading_day(datetime.now(ET))
 
 
-def _needs_refresh(sid: str, frequency: str, existing_statuses: dict) -> bool:
+def _last_observation_date(series_data: Optional[dict]) -> Optional[date]:
+    """Date of the last non-null observation in a stored series, or None.
+
+    Standard series: last index with a non-null value in `values`.
+    yield_curve: last date where any tenor in `tenors` is non-null.
     """
-    Return True if this series should be fetched on this run.
+    if not series_data:
+        return None
+    dates = series_data.get("dates") or []
+    if "tenors" in series_data:
+        cols = [c for c in (series_data.get("tenors") or {}).values() if c]
+        for i in range(len(dates) - 1, -1, -1):
+            if any(i < len(c) and c[i] is not None for c in cols):
+                return date.fromisoformat(dates[i][:10])
+        return None
+    vals = series_data.get("values") or []
+    for i in range(min(len(dates), len(vals)) - 1, -1, -1):
+        if vals[i] is not None:
+            return date.fromisoformat(dates[i][:10])
+    return None
 
-    existing_statuses is the metadata.statuses dict from the prior data.json,
-    keyed by series id. Each entry may carry a 'last_fetched' ISO timestamp
-    written by the orchestrator on the previous successful fetch.
+
+def _parse_last_fetched(text: str) -> datetime:
+    """last_fetched is a naive ISO timestamp written in Pacific time; return it aware (PT)."""
+    dt = datetime.fromisoformat(text)
+    return dt.replace(tzinfo=PT) if dt.tzinfo is None else dt
+
+
+def _period_start(today: date, months: int) -> date:
+    """First day of the most recently ended calendar period (month=1, quarter=3)."""
+    if months == 1:
+        first = today.replace(day=1)
+        prev = first - timedelta(days=1)
+        return prev.replace(day=1)
+    q_first_month = 3 * ((today.month - 1) // 3) + 1
+    q_start = date(today.year, q_first_month, 1)
+    prev = q_start - timedelta(days=1)
+    return date(prev.year, 3 * ((prev.month - 1) // 3) + 1, 1)
+
+
+def _needs_refresh(
+    sid: str,
+    frequency: str,
+    existing_statuses: dict,
+    last_obs: Optional[date] = None,
+    publish_lag_bd: int = 0,
+    now: Optional[datetime] = None,
+) -> bool:
     """
-    last_str = existing_statuses.get(sid, {}).get("last_fetched")
+    Return True if this series should be fetched on this run (Amendment B).
+
+    existing_statuses : metadata.statuses of the prior data_v2.json, keyed by series id
+                        ({status, last_fetched (naive PT ISO), error?}).
+    last_obs          : last non-null observation date stored for the series
+                        (see _last_observation_date); None if no data stored.
+    publish_lag_bd    : daily_release only — trading days between an observation's
+                        date and its publication (FRED 1, Treasury 0).
+    now               : aware datetime override (tests / simulation); default now.
+
+    Time zones: trading-day logic (open/close, last completed trading day) uses
+    ET; calendar logic (once-per-day throttle, ended month/quarter) uses
+    Pacific time, the zone of last_fetched and of the CI runner (TZ=America/Los_Angeles).
+
+    A series whose last status is "error" is never satisfied: it is due on every
+    run of its attempt window (for monthly/quarterly this overrides the
+    once-per-day throttle, since a failed attempt does not update last_fetched).
+    """
+    now = now or datetime.now(PT)
+    now_et = now.astimezone(ET)
+    now_pt = now.astimezone(PT)
+    st = existing_statuses.get(sid, {}) or {}
+    last_str = st.get("last_fetched")
     if not last_str:
-        return True  # never fetched — always run
+        return True  # never fetched
+    last = _parse_last_fetched(last_str)
+    errored = st.get("status") == "error"
 
-    last = datetime.fromisoformat(last_str)
-    now  = datetime.now()
-
-    if frequency == "market_daily":
-        if _market_is_open():
+    if frequency in ("intraday", "daily_after_close"):
+        if frequency == "intraday" and market_calendar.market_is_open(now_et):
             return True
-        lbd = _last_completed_business_day()
-        if last.date() < lbd:
+        if errored:
             return True
-        if last.date() == lbd:
-            # Data was fetched on the last business day — only skip if the fetch
-            # happened after the close. Pre-close fetches (e.g. a 10 AM run) leave
-            # stale prices; a post-close run must re-fetch to pick up closing values.
-            close_et = datetime(lbd.year, lbd.month, lbd.day, 16, 0, tzinfo=ET)
-            close_local = close_et.astimezone().replace(tzinfo=None)
-            return last < close_local
-        return False
+        lctd = market_calendar.last_completed_trading_day(now_et)
+        # satisfied once a fetch happened at/after the last completed close
+        return last < market_calendar.close_datetime_et(lctd)
 
-    if frequency == "daily_once":
-        lbd = _last_completed_business_day()
-        return last.date() < lbd
+    if frequency == "daily_release":
+        if errored or last_obs is None:
+            return True
+        lctd = market_calendar.last_completed_trading_day(now_et)
+        expected = market_calendar.trading_days_before(lctd, publish_lag_bd)
+        return last_obs < expected
 
-    if frequency == "monthly":
-        return (last.year, last.month) < (now.year, now.month)
-
-    if frequency == "quarterly":
-        def _qtr(dt: datetime) -> tuple:
-            return (dt.year, (dt.month - 1) // 3)
-        return _qtr(last) < _qtr(now)
+    if frequency in ("monthly", "quarterly"):
+        today = now_pt.date()
+        if last_obs is not None and last_obs >= _period_start(
+            today, 1 if frequency == "monthly" else 3
+        ):
+            return False  # expected period already present
+        if errored:
+            return True
+        return last.astimezone(PT).date() < today  # at most once per calendar day
 
     return True  # unknown frequency — always fetch
 
@@ -735,7 +786,7 @@ def run(filter_ids: Optional[list] = None, force: bool = False) -> None:
     statuses:   dict = {}
     failures:   list = []
     skipped:    list = []
-    now_ts = datetime.now().isoformat(timespec="seconds")
+    now_ts = datetime.now(PT).replace(tzinfo=None).isoformat(timespec="seconds")  # naive PT
 
     # ------------------------------------------------------------------
     # Main series loop
@@ -743,10 +794,17 @@ def run(filter_ids: Optional[list] = None, force: bool = False) -> None:
     for entry in series_config:
         sid       = entry["id"]
         source    = entry["source"]
-        frequency = entry.get("refresh_frequency", "market_daily")
+        frequency = entry.get("refresh_frequency", "intraday")
+        lag = entry.get("publish_lag_bd")
+        if lag is None:
+            lag = 1 if (source == "fred" and frequency == "daily_release") else 0
 
         # Frequency check — carry forward existing data if still current
-        if not force and not _needs_refresh(sid, frequency, existing_statuses):
+        if not force and not _needs_refresh(
+            sid, frequency, existing_statuses,
+            last_obs=_last_observation_date(existing_series.get(sid)),
+            publish_lag_bd=lag,
+        ):
             if sid in existing_series:
                 series_out[sid] = existing_series[sid]
                 statuses[sid]   = {**existing_statuses.get(sid, {"status": "ok"})}
@@ -855,7 +913,7 @@ def run(filter_ids: Optional[list] = None, force: bool = False) -> None:
         print(f"\n  Skipped (data current per refresh_frequency):")
         for s in skipped:
             freq = next(
-                (e.get("refresh_frequency", "market_daily")
+                (e.get("refresh_frequency", "intraday")
                  for e in config.get("series", []) if e["id"] == s),
                 "?",
             )

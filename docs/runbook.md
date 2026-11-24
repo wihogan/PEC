@@ -7,9 +7,21 @@ Repo: https://github.com/wihogan/PEC
 
 | What | When (Pacific, Mon-Fri) | Notes |
 |---|---|---|
-| Mac trigger (primary) | 1:20 PM and 3:50 PM | Mac runs `gh workflow run`; the Mac must be awake and online |
+| Mac trigger (primary) | 6:45, 7:45, 8:45, 9:45, 10:45, 11:45 AM, 12:45 PM (market hours), 1:20 PM (post-close final), 3:50 PM (retry) | Mac runs `gh workflow run`; the Mac must be awake and online. After changing times, run `git pull && mac/install.sh` once |
 | GitHub schedule (backup) | about 2:17 PM and 3:47 PM (3:17 / 4:47 PM in summer time) | Only active after Phase 3 go; if a run is already up to date it does little |
 | Watchdog (Mac) | 4:30 PM | Alerts if no successful refresh happened today |
+
+How fresh is each data type (a run only fetches what is due; the rest is carried forward):
+
+| Data | Series | When it is fetched |
+|---|---|---|
+| Market prices (`intraday`) | All Yahoo series: indexes, metals, crypto | Every run while the market is open (9:30 AM-4:00 PM ET; 1:00 PM ET on early-close days); once more after the close. No market-hours fetches on weekends or NYSE holidays. |
+| Daily releases (`daily_release`) | FRED rates, TIPS, credit, Fed funds, FX, oil; Treasury yield curve | Every run until the newest expected day arrives (FRED: previous trading day; yield curve: the last closed day), then not again until the next day is due |
+| Valuation (`daily_after_close`) | The 5 multpl series | Once per trading day, at the first run after the close; retried on later runs that day if it failed |
+| Monthly (`monthly`) | CPI, NBER recession | Once a day until the last finished month appears, then idle until the next month ends |
+| Quarterly (`quarterly`) | GDP, 3 delinquency series | Same, per finished calendar quarter |
+
+A failed fetch never counts as done; the next run tries again.
 
 Each run: fetch data, build the page, run the healthcheck, then publish to the page. If anything fails the old page stays up and you get a Telegram message. The data's memory (state) is saved only after a good run.
 

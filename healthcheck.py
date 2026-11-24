@@ -16,7 +16,7 @@ Hard-fail rules:
   3. PEC.html >= size floor, no unreplaced placeholders (outside HTML comments),
      and the <script id="pec-data"> body parses to JSON equal to data_v2.json.
   4. Source-level failures over series attempted this run:
-     > 3 failed market_daily series; all attempted FRED failed (>= 3 attempted);
+     > 3 failed intraday/daily_release series (reported as "market_daily"); all attempted FRED failed (>= 3 attempted);
      all attempted Yahoo failed (>= 3 attempted). Treasury / multpl: staleness only.
   5. Staleness of daily series (calendar days since last non-null observation).
   6. valuation_inputs.forward_eps_ntm is the approved override from the config.
@@ -41,17 +41,20 @@ HERE = Path(__file__).resolve().parent
 # ---------------------------------------------------------------------------
 # Thresholds (calendar days unless noted)
 # ---------------------------------------------------------------------------
+# Frequencies counted by rule 4 (formerly "market_daily"): intraday + daily_release.
+DAILY_FREQUENCIES = ("intraday", "daily_release")
+
 THRESHOLDS: dict = {
     # Hard fail when age > value. Per-id entry wins over per-frequency entry.
     # Only frequencies / ids listed here are gated; slow series are warn-only.
-    "fail_by_frequency": {"market_daily": 7, "daily_once": 7},
+    "fail_by_frequency": {"intraday": 7, "daily_release": 7},
     "fail_by_id": {
         "eur_usd": 14, "cad_usd": 14, "jpy_usd": 14,   # FRED FX (weekly H.10 batches)
         "wti_crude": 14,                                # FRED weekly batch
         "yield_curve": 7,
     },
     # Warn when age > value. Per-id entry wins over per-frequency entry.
-    "warn_by_frequency": {"monthly": 110, "quarterly": 300},
+    "warn_by_frequency": {"daily_after_close": 7, "monthly": 110, "quarterly": 300},
     "warn_by_id": {"sp500_earnings": 220},
     # Derived / valuation inputs (warn only).
     "warn_fwd_pe_history_days": 60,
@@ -230,7 +233,8 @@ def run_checks(data_path: Path, html_path: Path, config_path: Path, now: datetim
         att = [sid for sid in cfg_series if attempted(sid)]
         md_failed = [
             s for s in att
-            if cfg_series[s].get("refresh_frequency") == "market_daily" and failed(s)
+            if cfg_series[s].get("refresh_frequency", "intraday") in DAILY_FREQUENCIES
+            and failed(s)
         ]
         if len(md_failed) > THRESHOLDS["max_failed_market_daily"]:
             failures.append(
@@ -250,7 +254,7 @@ def run_checks(data_path: Path, html_path: Path, config_path: Path, now: datetim
 
         # Rule 5 (fail) and slow-series warnings
         for sid, entry in cfg_series.items():
-            freq = entry.get("refresh_frequency", "market_daily")
+            freq = entry.get("refresh_frequency", "intraday")
             age = ages.get(sid)
             limit = _fail_threshold(sid, freq)
             if limit is not None:
