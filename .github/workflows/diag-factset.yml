@@ -2,6 +2,9 @@ name: diag-factset
 # Temporary smoke test of fetchers/factset_eps.py from a GitHub runner (remove after verification).
 on:
   workflow_dispatch:
+  push:
+    branches: [amendment-b]
+    paths: ['.github/workflows/diag-factset.yml']
 permissions:
   contents: read
 jobs:
