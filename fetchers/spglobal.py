@@ -282,13 +282,14 @@ def record_month_end(as_of: date, value: float) -> bool:
     try:
         entries = _load_history_entries()
         have = {str(e["date"])[:7] for e in entries}
+        modified = False
         for e in _seed_history_from_yaml():
             if e["date"][:7] not in have:
                 entries.append(e)
                 have.add(e["date"][:7])
+                modified = True  # seed rows must reach an existing cache (D3)
         key = f"{as_of.year}-{as_of.month:02d}"
         val = round(float(value), 2)
-        modified = False
         for e in entries:
             if str(e["date"])[:7] == key:
                 if abs(float(e["value"]) - val) > 1e-9:

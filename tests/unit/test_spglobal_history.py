@@ -210,15 +210,6 @@ def test_record_month_end_cache_wins_over_seed_for_same_month(seed):
     assert _entries()["2026-09-30"] == 999.0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "spglobal.record_month_end: seed rows merged into an existing cache are only saved when the "
-        "current month's value changes (save is gated on `modified`), so new seed backfill rows do "
-        "not reach an existing history cache on runs where the FactSet value is unchanged "
-        "(docstring: 'adding backfill rows to the seed also reaches an existing cache')."
-    ),
-)
 def test_record_month_end_persists_seed_merge_when_value_unchanged(seed):
     spglobal._save_history_entries([{"date": "2026-11-30", "value": 419.64}])
     spglobal.record_month_end(date(2026, 11, 27), 419.64)
