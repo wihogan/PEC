@@ -80,3 +80,4 @@ The items listed above for re-run (6.2-3, 6.2-4, 6.2-6c, 6.2-10) were covered by
 | 6.2-10 (EPS override / FactSet precedence) | 45319284815, 45319479573, 45319693938 | override wins when newer; FactSet wins when newer; restore OK |
 
 The Phase 6 fixes made after that QA (docs/plan.md, "Phase 6 QA fixes") have unit tests but no live run yet. 6.2-4b, 8 and 9 remain pending observation; D2 is dropped (see plan Amendment A).
+Owner confirmed receipt of all three Telegram failure alerts from Phase 5 runs 45311178206, 45313878206, 45314681065 (2026-11-24) — items 6.2-6/7 notification: PASS (owner).

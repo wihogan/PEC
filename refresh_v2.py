@@ -685,6 +685,9 @@ def _needs_refresh(
     daily_after_close and daily_release series retry on every run; monthly and
     quarterly errors are throttled on last_attempt to at most one attempt per Pacific
     calendar day (and are retried even when the expected period is present).
+    Monthly and quarterly series whose expected period is present and whose last status
+    is ok are re-fetched once their last attempt (last_attempt, fallback last_fetched)
+    is 7 or more Pacific calendar days old, to pick up revisions; otherwise skipped.
     An unparseable timestamp counts as never fetched.
     """
     now = now or datetime.now(PT)
@@ -735,7 +738,9 @@ def _needs_refresh(
         if last_obs is not None and last_obs >= _period_start(
             today, 1 if frequency == "monthly" else 3
         ):
-            return False  # expected period already present
+            # Expected period present and last status ok: re-check weekly to pick
+            # up revisions (owner decision 2026-11-24; QA m3). PT calendar days.
+            return (today - (attempt or last).astimezone(PT).date()).days >= 7
         # Not yet satisfied: at most one attempt per PT calendar day.
         return (attempt or last).astimezone(PT).date() < today
 
