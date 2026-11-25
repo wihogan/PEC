@@ -319,3 +319,7 @@ Freshness (`docs/runbook.md` section 1) and alerts (section 2) updated for the n
 - **m2 (docs/code).** Earnings-failover text removed from Amendment D "Behaviour", runbook (section 1 and 2) and the dead `real_earnings` multpl branches/constants; provisional wording unified ("current month plus the two before it").
 - **N2** failing-notice text now points to Amendment D. **N3** a failed attempt keeps `source_used` in `metadata.statuses` (matches the carried-forward series).
 - **Deferred.** m3 (back-message can fire while ratio series still hold multpl data until the next post-close run): harmless, early by at most one run. N1 (notice wording when the primary workbook loaded but was rejected as stale): wording only. N4 (browser User-Agent for multpl): deliberate, multpl blocks identifying agents. N5 accepted. N6 pre-existing (Amendment C).
+
+### Amendment D — merged to production (2026-11-25)
+QA re-check (fresh-context Opus; the Fable reviewer hit its usage limit mid-re-check) verdict MERGE: M1, M2 resolved; deferrals accepted. Nits m2 (stale docstring, stray comment) fixed at merge.
+Open follow-up (minor, only when multpl is back but serves some ratio pages and not others): **R1** — if a single ratio page fails on multpl while others are served, the "failed on N different days" notice can repeat; tighten the failing-day definition then.

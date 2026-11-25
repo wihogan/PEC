@@ -33,7 +33,7 @@
 #     down) unless its newest raw row dated <= today is within 7 calendar days of today (PT).
 #     This subsumes the old "newest month <= 3 months old" rule, which was removed.
 #
-# # Source discovery
+# Source discovery
 # ----------------
 # https://shillerdata.com/ links the workbook with a protocol-relative, versioned href
 # (//img1.wsimg.com/blobby/go/.../downloads/<uuid>/ie_data.xls?ver=...). The link is
@@ -770,7 +770,7 @@ def fetch(series_id: str, start_date: str = "2010-01-01", end_date: str = None, 
     """
     Return a DataFrame ['date', 'value'] (sorted, no NaN) for a Shiller-derived series.
 
-    Source order per run: shillerdata.com -> multpl.com (not for nominal_earnings) -> Yale ->
+    Source order per run: shillerdata.com -> multpl.com (four ratio series only; not the earnings series) -> Yale ->
     FetchError. df.attrs['provisional_from'] holds the ISO date of the first provisional point
     (or None); df.attrs['source_used'] is 'shiller', 'multpl' or 'yale'. See the module header
     for splice and provisional rules.

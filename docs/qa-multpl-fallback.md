@@ -100,3 +100,66 @@ Recommended fix: for the current month prefer the row dated by the series conven
 ## Reproduction
 
 Mock harness used (not committed): requests router + yfinance stub around `shiller.fetch` / `shiller.pending_notice`, real workbook at `/home/claude/xls_check/ie_data.xls`, saved multpl pages with injected November rows, health file in a temp directory. Scenarios: source flip on one day, the post-close / retry / next-morning sequence for three days, saved pages fetched on later dates, multpl frozen early in the month, production health file with primary up, all-down request count, 200 page without table.
+
+## Re-check (Opus, 2026-11-25)
+
+- Branch `multpl-fallback` at 97f2040 (fixes 4b9678e, tests 97f2040), checked out as local `qa-m`. Independent reviewer, fresh context. No code changed, nothing pushed, production not touched (the `state` branch was only cloned read-only to `/tmp/qa3state`, commit 04efa02).
+- Suite: `pytest tests` -> **1175 passed, 4 deselected**, 1 warning (pandas NaT). CI on 97f2040: `ci` success (run 45698676574).
+- Reproductions: a separate, uncommitted pytest file (`/tmp/qa_recheck/test_recheck.py`, `test_edges.py`) loads the repo `conftest` as a plugin and reuses the `net` / `page` / `multpl_ok` helpers from `tests/unit/test_multpl_fallback.py`. It runs `refresh_v2.run()` end to end on the six Shiller series, seeded with the production `data_v2.json` and `shiller_health.json`.
+
+### Verdict: MERGE
+
+Both majors are resolved and reproduce as fixed. No blocker and no major remain. One new minor (R1) is a narrower version of M1. It needs a partial multpl failure, so it is worth a follow-up but does not block the merge. The fallback path is also unreachable today because multpl.com is down.
+
+### Status of the original findings
+
+| # | Status | Evidence |
+|---|---|---|
+| M1 | **RESOLVED** (residual R1 below) | `fetchers/shiller.py:446`: a failing day is counted only if a `_MULTPL_IDS` series failed. Reproduced through `refresh_v2.run` with the real retry scheduling (`_needs_refresh`), shillerdata.com down, multpl fresh, Yale stale, over 11 runs from Mon 11-16 13:20 to Thu 11-19 06:45. Post-close runs attempt 6 series and retries attempt 2 (earnings only). `fail_days` stays 0 throughout, and exactly one notice is sent ("served by multpl.com fallback"). No "has failed" notice. Tests: `test_m1_*` (`tests/unit/test_multpl_fallback.py:628-662`). |
+| M2 | **RESOLVED** | `fetchers/shiller.py:344-350`: the freshness check runs on raw rows dated on or before today, with a 7-day limit, and is not cached as down. Reproduced with the saved pages as-is (newest Oct 30/31), today 2026-11-25, primary down, Yale stale, and **production's own data_v2.json** as the prior. All six series are carried forward byte-identical, including the November points (P/E 2026-11-01 25.0317, CAPE 38.227, DY 2026-11-25 0.0111). Statuses are `error` with "multpl data stale", there are 4 multpl requests (one per page), and `fail_days` is 1. The future-dated Nov 30 month-end row does not mask the frozen page (`test_m2_future_month_end_row_does_not_mask_frozen_page`). |
+| m1 | **RESOLVED** (nit N7) | `fetchers/shiller.py:353-358`: the convention-dated row wins, with the latest row as fallback, applied to all four series. Covered by `test_row_rule`, `test_row_rule_ended_months` and `test_flip_shiller_multpl_shiller_same_month` (`:757-820`). |
+| m2 | **PARTIAL** (nit-level leftovers) | Plan, runbook and dead code are fixed. Two leftovers remain: the `fetch()` docstring `fetchers/shiller.py:773` still says "multpl.com (not for nominal_earnings)" (should say "not for the earnings series"), and the header at `:36` reads `# # Source discovery`, a stray `#` introduced by 4b9678e. |
+| m3 | **ACCEPTED-DEFERRAL** | The reason holds: the message is harmless. The plan's "early by at most one run" understates it slightly, because the ratio series keep `source_used: multpl` until the next post-close run, which can be about a trading day later. Still cosmetic. |
+| N1 | ACCEPTED-DEFERRAL | Wording only. |
+| N2 | **RESOLVED** | `fetchers/shiller.py:517` now points to Amendment D. |
+| N3 | **RESOLVED** | `refresh_v2.py:1075-1076`; `healthcheck.py:235-236` passes it through to `health.json`. Asserted in `test_m2_rejection_carries_november_point_forward`. |
+| N4 | ACCEPTED-DEFERRAL | The reason given ("multpl blocks identifying agents") is plausible but cannot be verified from this sandbox. |
+| N5 | ACCEPTED | |
+| N6 | ACCEPTED-DEFERRAL | Pre-existing from Amendment C and unchanged. |
+| T1 | **RESOLVED except one gap** | Added tests: an earnings-only retry sequence, the 7-day boundary on saved and injected pages, future-dated rows, carry-forward through `refresh_v2`, the row rule per series, and a same-month Shiller -> multpl -> Shiller flip. Still missing: a run sequence where only **some** ratio series fail on multpl (this would have caught R1). |
+
+### New findings
+
+**R1 (MINOR). The false "all sources failed" notice still repeats daily when only one ratio series fails on multpl.** Location: `fetchers/shiller.py:442-447`. In the post-close run, three ratio series are served by multpl, so the streak is cleared. The one failed ratio series stays `error` and is retried on every later run, together with the earnings series. Those retry runs serve nothing, and a ratio series failed, so each one counts as a failing day. I reproduced this with the dividend-yield page broken (200 response, no table) and, separately, with only that page frozen at Oct 31:
+
+| Run | Attempted | fail_days | Notice |
+|---|---|---|---|
+| 11-16 13:20 | 6 | 0 | fallback notice (correct) |
+| 11-16 14:17 | 3 | 1 | none |
+| 11-17 06:45 | 3 | 2 | "Valuation data fetch (shillerdata.com, multpl.com and Yale) has failed on 2 different days. P/E, CAPE and earnings series are carried forward" |
+| 11-17 13:20 | 6 | 0 (re-armed) | none |
+| 11-18 06:45 | 3 | 2 | the same notice again (and again on 11-19) |
+
+The message is untrue, because P/E and CAPE are current from multpl, and it repeats every morning for the length of the outage. This is the same symptom as M1, but the trigger is narrower: a single page failing to parse, failing the range check or going stale while the others are fine. All four pages share one template and are updated together, so this is unlikely, which is why I rate it MINOR. Suggested fix: when something is served, record `last_served_date = today` in the health file, and in `_finalize_run` skip `_record_failure` when `last_served_date` is today or the previous PT day. Equivalently, count a failing day only when no series has been served by any source since the last post-close run. Add the partial-failure sequence as a test.
+
+**N7 (nit). Row-rule tie when the snapshot date equals the convention date.** On the last day of a month the dividend-yield snapshot and the month-end row are both dated that day. The same happens for P/E, EY and CAPE on the 1st. The stable sort then keeps the row multpl lists first, which is the snapshot. Probe on Nov 30: snapshot 1.20 % kept over the month row 1.09 %. This lasts one day and only on the multpl path. Optional fix: break ties on the original page order, so that the second-listed (month) row wins.
+
+**N8 (nit, carried over from M2's optional suggestion, not adopted).** On the first trading day of a month, if multpl has not yet added the new month's rows (newest snapshot is the previous day, which passes the freshness check), a Shiller -> multpl flip drops production's new-month point. The series ends at the previous month. This self-corrects the next day. Acceptable.
+
+**Other regression checks on 4b9678e, no issues:**
+- 7-day rule versus weekends and holidays: valuation fetches happen after the close on trading days, and the longest market closure is well under 7 days.
+- The rejection is not cached as `down`, so each ratio series re-checks the same cached page, with no extra requests (4 requests in total).
+- The removed 3-month rule is implied by the 7-day rule.
+- The month-end clamp can still date a value up to 7 days old as today. This is bounded and documented.
+- `source_used` on a failed attempt only copies the existing series value. With production data, which has no `source_used` yet, nothing is added, which is correct.
+- Earnings-only failures never touch `fail_days` or `primary_down_since`.
+- No new paths to Telegram notices beyond R1.
+
+### Merge-time check against production state
+
+`/tmp/qa3state` at 04efa02: `shiller_health.json` is `{fail_days 0, last_fail_date null, last_e 2026-09, notified {}}`. The valuation statuses were last fetched 2026-11-25 11:57 PT, so they are due at the first post-close run. I simulated that run at 2026-11-25 13:20 PT with the primary up, using the real workbook copy `/home/claude/xls_check/ie_data.xls` (^GSPC stubbed off, so Shiller's P is used and values differ slightly from a real run). Results:
+- Exactly 2 requests (landing, workbook). No multpl or Yale request.
+- All six series are `ok`, with `source_used: shiller` in both the series and the statuses. `provisional_from` is unchanged in kind.
+- `shiller_health.json` gains `source: shiller` and `primary_down_since: null`. `fail_days` stays 0 and `notified` stays `{}`.
+- No notice text is written to `eps_change.txt`.
+- I merged the six refreshed series into the full production `data_v2.json` and ran `healthcheck.run_checks` with the real config. There are no failures apart from rule 3, which is expected because no HTML was rendered here. Rule 2 passes with no missing or unknown ids, and rules 4 and 5 pass. There are no valuation warnings, and `health.json` series carry `source_used: shiller`.
