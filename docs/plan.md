@@ -278,3 +278,7 @@ Owner approved ("recommended defaults") replacing the five multpl.com series (do
 - M3: `.cache/shiller_health.json` (persisted on the state branch via tools/state.sh) drives a one-time Telegram notice (appended to `eps_change.txt`, name kept for compatibility) after 2 distinct failing PT days since the last success, or when Shiller's latest E is more than 5 months old; re-arms after recovery.
 - Healthcheck rule 2: an id missing from the output with status `error`/absent is a warning ("new series not yet populated"); missing with status `ok` still fails.
 - Licensing: shillerdata.com terms/robots not yet verified - owner to confirm; the workbook is downloaded once per trading day with an identifying User-Agent.
+
+### Amendment C — switched to production (2026-11-25)
+Owner approved the switch after QA re-check (MERGE). Merge 63c5bac; first production run 45690121543 succeeded and deployed: 42 series, 0 failures; all six Shiller-sourced series `ok`; November provisional values P/E 25.03, CAPE 38.23, EY 3.99 %, DY 1.11 %.
+Open follow-ups (not blocking): **N1** — the 15 % price sanity check drops a genuine >15 % crash month when Shiller has no row yet (point reappears once Shiller publishes); **m3** — an out-of-range derived value freezes the series until the 2-day Shiller notice fires (deferred: surfaced by M3 notice; revisit if it occurs).
