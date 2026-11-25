@@ -17,7 +17,7 @@ How fresh is each data type (a run only fetches what is due; the rest is carried
 |---|---|---|
 | Market prices (`intraday`) | All Yahoo series: indexes, metals, crypto | Every run while the market is open (9:30 AM-4:00 PM ET; 1:00 PM ET on early-close days); once more after the close. No market-hours fetches on weekends or NYSE holidays. |
 | Daily releases (`daily_release`) | FRED rates, TIPS, credit, Fed funds, FX, oil; Treasury yield curve | Every run until the newest expected day arrives (FRED: previous trading day; yield curve: the last closed day), then not again until the next day is due |
-| Valuation (`daily_after_close`) | The 6 Shiller-derived valuation series (`sp500_dividend_yield`, `sp500_pe`, `sp500_earnings_yield`, `sp500_earnings`, `sp500_earnings_nominal`, `shiller_cape`); latest month provisional (`provisional_from`) | Once per trading day, at the first run after the close; retried on later runs that day if it failed |
+| Valuation (`daily_after_close`) | The 6 Shiller-derived valuation series (`sp500_dividend_yield`, `sp500_pe`, `sp500_earnings_yield`, `sp500_earnings`, `sp500_earnings_nominal`, `shiller_cape`); latest month provisional (`provisional_from`); source order shillerdata.com, then multpl.com, then Yale (`source_used` in `data_v2.json`, `metadata.statuses` and `health.json`; `sp500_earnings_nominal` has no multpl source) | Once per trading day, at the first run after the close; retried on later runs that day if it failed |
 | Monthly (`monthly`) | CPI, NBER recession | Once a day until the last finished month appears, then re-checked every 7 days (Pacific calendar days) to pick up revisions |
 | Quarterly (`quarterly`) | GDP, 3 delinquency series | Same, per finished calendar quarter (daily until it appears, then weekly re-check) |
 
@@ -33,6 +33,9 @@ Each run: fetch data, build the page, run the healthcheck, then publish to the p
 | `[TEST] ⚠️ PEC refresh FAILED` | A test run on the test state failed | Normal during testing; ignore otherwise |
 | `⚠️ PEC: Mac could not trigger refresh (gh exit N)` | The Mac could not start the run (login expired, offline) | Run `gh auth status` on the Mac; `gh auth login` if needed. Meanwhile do a manual refresh. The GitHub backup schedule may still run. |
 | `⚠️ PEC: no successful refresh today as of HH:MM PT` | Watchdog found no successful run today | Trigger a manual refresh (section 3), then check the Mac jobs |
+| `ℹ️ PEC valuation series served by multpl.com fallback — shillerdata.com unavailable since DATE` (or `Yale ie_data.xls`) | shillerdata.com could not be used and a fallback is serving the valuation series (sent once; again only if the fallback source changes) | Nothing required. `sp500_earnings_nominal` stays carried forward while on the multpl fallback. If it lasts more than a few days, check shillerdata.com in a browser. |
+| `✅ PEC valuation series back on shillerdata.com` | The primary source works again after a fallback message | Nothing |
+| `ℹ️ PEC: Valuation data fetch (shillerdata.com, multpl.com and Yale) has failed on N different days...` | Every source failed on N different days; valuation series are carried forward | Ask for help if it persists; see `docs/plan.md` Amendment D |
 | `⏳ PEC: refresh still in progress` | A run is going but not finished at 4:30 PM | Wait a few minutes; you will be alerted again only if it fails |
 | `⚠️ PEC: watchdog could not query GitHub` | Mac/GitHub login problem | Check `gh auth status` on the Mac |
 

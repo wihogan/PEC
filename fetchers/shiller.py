@@ -2,6 +2,35 @@
 #
 # Replaces the multpl.com fetcher (owner decision 2026-11-24; docs/plan.md Amendment C).
 #
+# Source order (docs/plan.md Amendment D, 2026-11-25) - per run, shared by all six series
+# ---------------------------------------------------------------------------------------
+#   1. shillerdata.com workbook (primary)
+#   2. multpl.com tables (first fallback; Shiller's downstream republisher). Covers
+#      dividend_yield, pe, earnings_yield, cape and real_earnings; NOT nominal_earnings.
+#   3. Yale ie_data.xls (last resort; still rejected when its last earnings month is >9 months old)
+#   4. fail closed (FetchError -> refresh_v2 carries the previous series forward)
+# Each source is attempted at most once per run (negative-cached for all series); the three
+# network stages share the 90 s budget. df.attrs['source_used'] ('shiller' | 'multpl' |
+# 'yale') records which source served a series.
+#
+# multpl fallback (Amendment D)
+# -----------------------------
+#   * Parsing is fetchers.multpl._parse_html (via multpl.fetch_live, which bypasses multpl's
+#     on-disk cache: runners are ephemeral and a stale cache would mask an outage; there is
+#     no stale-cache fallback - the archive + carry-forward is the fallback).
+#   * dividend_yield / pe / earnings_yield / cape: archive rows <= 2026-10 unchanged, multpl
+#     rows strictly after 2026-10 appended. Several rows in one month collapse to the latest
+#     dated one; dates use the same conventions as the Shiller path (first-of-month for
+#     pe/ey/cape; month-end for dividend yield and earnings, the in-progress month clamped to
+#     today). Range checks apply to the appended rows.
+#   * real_earnings: multpl's whole 's-p-500-earnings' series from start_date, on multpl's
+#     own basis (it is NOT re-based to the latest CPI month the way the Shiller path is, so
+#     recent values can differ from the Shiller-path series by the CPI ratio).
+#   * Provisional: a row flagged with the dagger (estimate) within the last 3 months, or any
+#     row of the current month; df.attrs['provisional_from'] is the first such date.
+#   * Staleness: the newest multpl month must be <= 3 months old (<= 9 for real_earnings,
+#     whose publication lags), else the source is rejected.
+#
 # Source discovery
 # ----------------
 # https://shillerdata.com/ links the workbook with a protocol-relative, versioned href
@@ -47,18 +76,23 @@
 #     Ended months stay provisional while Shiller's D/E for them are carried forward, so
 #     their values change only when Shiller publishes new D/E/CPI/CAPE (no month-end jump).
 #
-# Network limits (docs/qa-shiller.md M2)
-# --------------------------------------
-# A failed workbook load is remembered for the process (at most ONE landing attempt and ONE
-# Yale attempt per run for all six series); connect timeout 10 s, read timeout 30 s; all
-# Shiller network work (landing, workbook, Yale, ^GSPC download) shares a 90 s budget.
-# The ^GSPC download is cached including failure.
+# Network limits (docs/qa-shiller.md M2, Amendment D)
+# ---------------------------------------------------
+# A failed source is remembered for the process (at most ONE landing attempt, ONE Yale
+# attempt and - once a multpl request fails at the network level - no further multpl
+# requests per run for all six series); connect timeout 10 s, read timeout 30 s, both clamped
+# to what is left of a 90 s budget shared by landing, workbook, multpl, Yale and the ^GSPC
+# download. multpl connection-refused fails fast. The ^GSPC download is cached including
+# failure.
 #
 # Health marker (docs/qa-shiller.md M3)
 # -------------------------------------
-# .cache/shiller_health.json (persisted on the state branch) counts failing PT days and
-# remembers the last good workbook's last earnings month; pending_notice() returns a
-# one-time message after 2 failing PT days or when that month is >5 months old.
+# .cache/shiller_health.json (persisted on the state branch) counts failing PT days (a day on
+# which ALL sources failed), remembers the last primary workbook's last earnings month and
+# which source served the last run ('source', 'primary_down_since'); pending_notice() (called
+# once at the end of the run) finalises the run's outcome and returns one-time messages: after
+# 2 failing PT days, when that month is >5 months old (only while on the primary), when a
+# fallback starts serving (re-armed if the fallback changes) and when the primary is back.
 #
 # Licensing: shillerdata.com terms/robots not yet verified (owner to confirm); the workbook is
 # downloaded once per trading day with an identifying User-Agent.
@@ -83,6 +117,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
+from . import multpl
 from .base import FetchError
 
 log = logging.getLogger(__name__)
@@ -104,6 +139,19 @@ _CACHE_DIR = Path(__file__).parent.parent / ".cache"
 _HEALTH_PATH = _CACHE_DIR / "shiller_health.json"
 NOTICE_FAIL_DAYS = 2          # Telegram info after this many distinct failing PT days
 NOTICE_STALE_MONTHS = 5       # ... or when Shiller's latest E is more than this many months old
+
+# fetch() series_id -> multpl series id (nominal_earnings has no multpl equivalent)
+_MULTPL_IDS = {
+    "dividend_yield": "sp500_div_yield",
+    "pe":             "sp500_pe",
+    "earnings_yield": "sp500_earnings_yield",
+    "cape":           "shiller_pe",
+    "real_earnings":  "sp500_earnings",
+}
+_MULTPL_MAX_AGE_MONTHS = 3             # newest multpl month vs current month (ratio series)
+_MULTPL_EARNINGS_MAX_AGE_MONTHS = 9    # earnings publication lags
+_MULTPL_PROV_MONTHS = 2                # dagger rows this recent (or the current month) are provisional
+_FALLBACK_LABEL = {"multpl": "multpl.com", "yale": "Yale ie_data.xls"}
 
 _HEADERS = {"User-Agent": "PEC-dashboard/1.0 (personal macro dashboard; +https://github.com/wihogan/PEC)"}
 
@@ -128,7 +176,8 @@ _RANGES = {
 }
 
 # In-memory, per-process caches (the runner is ephemeral).
-_WORKBOOK_CACHE: dict = {}   # "monthly", "error", "t0" (network budget start)
+_WORKBOOK_CACHE: dict = {}   # "monthly"/"error" (shillerdata.com), "yale_monthly"/"yale_error",
+                             # "multpl" ({"down": err, <multpl id>: frame|err}), "run" (outcome), "t0" (budget start)
 _MTD_CACHE: dict = {}        # ^GSPC monthly averages, keyed by download start date; failure cached as None
 
 
@@ -181,34 +230,147 @@ def _months_between(a: pd.Period, b: pd.Period) -> int:
     return (b.year - a.year) * 12 + (b.month - a.month)
 
 
-def _get_monthly(today: date) -> pd.DataFrame:
-    """Monthly frame (index Period[M]; columns P, D, E, CPI, CAPE; NaN where blank), cached."""
+def _load_workbook(label: str, getter, today: date) -> tuple:
+    """Download + parse + staleness check one workbook source; returns (monthly, last_e)."""
+    content = getter()
+    monthly = _parse_workbook(content)
+    last_e = monthly["E"].dropna().index.max()
+    age = _months_between(last_e, pd.Period(today, "M"))
+    if age > _MAX_EARNINGS_AGE_MONTHS:
+        raise FetchError(f"workbook stale: last earnings month {last_e} is {age} months old")
+    log.info("[shiller] using %s workbook (%d bytes); last P %s, last E %s",
+             label, len(content), monthly["P"].dropna().index.max(), last_e)
+    return monthly, last_e
+
+
+def _get_primary(today: date) -> pd.DataFrame:
+    """Monthly frame from shillerdata.com (negative-cached: one landing attempt per run)."""
     if "monthly" in _WORKBOOK_CACHE:
         return _WORKBOOK_CACHE["monthly"]
     if "error" in _WORKBOOK_CACHE:
-        raise _WORKBOOK_CACHE["error"]   # negative cache: one landing + one Yale attempt per run
-    errors = []
-    for label, getter in (("shillerdata.com", lambda: _download(_discover_url())),
-                          ("yale", lambda: _download(_YALE_URL))):
+        raise _WORKBOOK_CACHE["error"]
+    try:
+        monthly, last_e = _load_workbook("shillerdata.com", lambda: _download(_discover_url()), today)
+    except FetchError as exc:
+        err = FetchError(f"shillerdata.com: {exc}")
+        log.warning("[shiller] shillerdata.com failed: %s", exc)
+        _WORKBOOK_CACHE["error"] = err
+        raise err from exc
+    _WORKBOOK_CACHE["monthly"] = monthly
+    _record_success(last_e)
+    return monthly
+
+
+def _get_yale(today: date) -> pd.DataFrame:
+    """Monthly frame from the Yale workbook (last resort; negative-cached: one attempt per run)."""
+    if "yale_monthly" in _WORKBOOK_CACHE:
+        return _WORKBOOK_CACHE["yale_monthly"]
+    if "yale_error" in _WORKBOOK_CACHE:
+        raise _WORKBOOK_CACHE["yale_error"]
+    try:
+        monthly, _ = _load_workbook("yale", lambda: _download(_YALE_URL), today)
+    except FetchError as exc:
+        err = FetchError(f"yale: {exc}")
+        log.warning("[shiller] yale failed: %s", exc)
+        _WORKBOOK_CACHE["yale_error"] = err
+        raise err from exc
+    _WORKBOOK_CACHE["yale_monthly"] = monthly
+    return monthly
+
+
+def _get_monthly(today: date) -> pd.DataFrame:
+    """Workbook frame: shillerdata.com, else Yale (multpl sits between them in fetch(), per series)."""
+    if "monthly" in _WORKBOOK_CACHE:
+        return _WORKBOOK_CACHE["monthly"]
+    try:
+        return _get_primary(today)
+    except FetchError as primary_exc:
         try:
-            content = getter()
-            monthly = _parse_workbook(content)
-            last_e = monthly["E"].dropna().index.max()
-            age = _months_between(last_e, pd.Period(today, "M"))
-            if age > _MAX_EARNINGS_AGE_MONTHS:
-                raise FetchError(f"workbook stale: last earnings month {last_e} is {age} months old")
-            log.info("[shiller] using %s workbook (%d bytes); last P %s, last E %s",
-                     label, len(content), monthly["P"].dropna().index.max(), last_e)
-            _WORKBOOK_CACHE["monthly"] = monthly
-            _record_success(last_e)
-            return monthly
-        except FetchError as exc:
-            errors.append(f"{label}: {exc}")
-            log.warning("[shiller] %s failed: %s", label, exc)
-    err = FetchError("Shiller workbook unavailable - " + " | ".join(errors))
-    _WORKBOOK_CACHE["error"] = err
-    _record_failure(today)
-    raise err
+            return _get_yale(today)
+        except FetchError as yale_exc:
+            raise FetchError(f"Shiller workbook unavailable - {primary_exc} | {yale_exc}") from yale_exc
+
+
+def _run_state() -> dict:
+    """Per-process record of this run's outcome (consumed by pending_notice -> _finalize_run)."""
+    return _WORKBOOK_CACHE.setdefault("run", {"served": {}, "failed": [], "primary_failed": False})
+
+
+# ---------------------------------------------------------------------------
+# multpl fallback source
+# ---------------------------------------------------------------------------
+def _get_multpl(mp_id: str, today: date) -> pd.DataFrame:
+    """
+    multpl table (columns date, value, estimate) for one multpl series id, straight from the
+    network (no on-disk cache). A network-level failure (refused, timeout, HTTP error, budget
+    exhausted) marks multpl down for the rest of the run - no further requests for any
+    series; a parse failure is cached for that series only.
+    """
+    cache = _WORKBOOK_CACHE.setdefault("multpl", {})
+    if cache.get("down") is not None:
+        raise cache["down"]
+    if mp_id in cache:
+        if isinstance(cache[mp_id], Exception):
+            raise cache[mp_id]
+        return cache[mp_id]
+    month_end = pd.Period(today, "M").to_timestamp(how="end").date().isoformat()
+    try:
+        df = multpl.fetch_live(mp_id, "1871-01-01", end_date=month_end, timeout=_timeout())
+    except FetchError as exc:
+        err = FetchError(f"multpl: {exc}")
+        if isinstance(exc.__cause__, requests.RequestException) or "budget" in str(exc):
+            cache["down"] = err
+        else:
+            cache[mp_id] = err
+        log.warning("[shiller] multpl failed for %s: %s", mp_id, exc)
+        raise err from exc
+    cache[mp_id] = df
+    log.info("[shiller] multpl %s: %d rows (%s -> %s)", mp_id, len(df),
+             df["date"].min().date(), df["date"].max().date())
+    return df
+
+
+def _multpl_series(series_id: str, today: date) -> pd.DataFrame:
+    """
+    One row per month for a multpl-covered series: columns date (Shiller-path date
+    convention), value, prov, period. Raises FetchError when multpl is stale.
+    """
+    _, month_end = _SERIES[series_id]
+    raw = _get_multpl(_MULTPL_IDS[series_id], today)
+    df = raw.sort_values("date", kind="stable").copy()
+    df["period"] = df["date"].dt.to_period("M")
+    df = df.drop_duplicates("period", keep="last")      # latest-dated row of a month wins
+    cur = pd.Period(today, "M")
+    limit = _MULTPL_EARNINGS_MAX_AGE_MONTHS if series_id == "real_earnings" else _MULTPL_MAX_AGE_MONTHS
+    last = df["period"].max()
+    if _months_between(last, cur) > limit:
+        raise FetchError(f"multpl data stale: last month {last}, current {cur}")
+    age = df["period"].apply(lambda per: _months_between(per, cur))
+    df["prov"] = (df["estimate"] & (age <= _MULTPL_PROV_MONTHS)) | (age == 0)
+    if month_end:
+        dates = df["period"].dt.to_timestamp(freq="M", how="end").dt.normalize()
+        dates = dates.where(dates <= pd.Timestamp(today), pd.Timestamp(today))
+    else:
+        dates = df["period"].dt.to_timestamp(how="start").dt.normalize()
+    df["date"] = dates
+    return df[["date", "value", "prov", "period"]].reset_index(drop=True)
+
+
+def _fetch_multpl(series_id: str, start_dt: pd.Timestamp, today: date) -> pd.DataFrame:
+    derived = _multpl_series(series_id, today)
+    archive_key = _SERIES[series_id][0]
+    if archive_key is None:   # real_earnings: multpl's own full series, its own CPI basis
+        _check_range(series_id, derived[derived["date"] >= start_dt], "multpl")
+        out, prov = derived, derived[derived["prov"]]
+    else:
+        arch_df, cutoff = _load_archive(archive_key)
+        cutoff_end = cutoff.to_timestamp(how="end").normalize()
+        appended = derived[derived["period"] > cutoff].copy()
+        _check_range(series_id, appended, "multpl")
+        out = pd.concat([arch_df[arch_df["date"] <= cutoff_end], appended[["date", "value"]]],
+                        ignore_index=True)
+        prov = appended[appended["prov"]]
+    return _finish(out, prov, start_dt, series_id, "multpl")
 
 
 # ---------------------------------------------------------------------------
@@ -242,10 +404,11 @@ def _record_failure(today: date) -> None:
 
 
 def _record_success(last_e: pd.Period) -> None:
-    """A good workbook clears the failure streak; notice markers are kept (cleared by pending_notice)."""
+    """A good PRIMARY (shillerdata.com) workbook clears the failure streak; notice markers are kept (cleared by pending_notice)."""
     try:
         raw = _read_health()
         new = {"fail_days": 0, "last_fail_date": None, "last_e": str(last_e),
+               "source": "shiller", "primary_down_since": None,
                "notified": raw.get("notified") if isinstance(raw.get("notified"), dict) else {}}
         if new != {k: raw.get(k) for k in new}:
             _write_health(new)
@@ -253,20 +416,54 @@ def _record_success(last_e: pd.Period) -> None:
         log.warning("[shiller] could not record success marker: %s", exc)
 
 
+def _finalize_run(today: date) -> None:
+    """
+    Turn this process's fetch outcomes into the health marker (called by pending_notice, once at
+    the end of the run; a no-op when nothing was fetched or the primary served the run, whose
+    success _get_primary already recorded).
+      * primary failed, something served by a fallback -> source = those fallbacks, streak cleared;
+      * primary failed and nothing at all was served   -> one failing PT day (all sources failed).
+    """
+    run = _WORKBOOK_CACHE.pop("run", None)
+    if not run or not run["primary_failed"]:
+        return
+    try:
+        served = [x for x in ("multpl", "yale") if x in set(run["served"].values())]
+        if served:
+            raw = _read_health()
+            raw.update({"fail_days": 0, "last_fail_date": None, "source": "+".join(served)})
+        elif run["failed"]:
+            _record_failure(today)
+            raw = _read_health()
+        else:
+            return
+        raw["primary_down_since"] = raw.get("primary_down_since") or today.isoformat()
+        _write_health(raw)
+    except Exception as exc:  # pragma: no cover
+        log.warning("[shiller] could not finalise run marker: %s", exc)
+
+
 def pending_notice(today: Optional[date] = None) -> Optional[str]:
     """
-    One-time informational message when the Shiller fetch has failed on 2 distinct PT days
-    since the last success, or Shiller's latest published earnings month is more than
-    5 months old; else None. Each condition is reported once (marker in the health JSON)
-    and re-arms when the condition clears.
+    One-time informational messages, each reported once (marker in the health JSON) and re-armed
+    when its condition changes or clears:
+      * ALL sources failed on 2 distinct PT days since the last success;
+      * Shiller's latest published earnings month is more than 5 months old (checked only while
+        the primary serves; on a fallback that month no longer advances);
+      * a fallback (multpl / Yale) started serving the series (re-sent if the fallback changes);
+      * the primary (shillerdata.com) is serving again after a fallback notice.
+    Else None. Also finalises this run's outcome first (see _finalize_run).
     """
     today = today or datetime.now(_PT).date()
+    _finalize_run(today)
     raw = _read_health()
     if not raw:
         return None
     notified = dict(raw["notified"]) if isinstance(raw.get("notified"), dict) else {}
     fail_days = int(raw.get("fail_days") or 0)
     failing = fail_days >= NOTICE_FAIL_DAYS
+    source = raw.get("source") or "shiller"
+    on_primary = source == "shiller"
     stale_months = None
     try:
         stale_months = _months_between(pd.Period(str(raw.get("last_e")), "M"), pd.Period(today, "M"))
@@ -275,25 +472,41 @@ def pending_notice(today: Optional[date] = None) -> Optional[str]:
     stale = stale_months is not None and stale_months > NOTICE_STALE_MONTHS
     msgs = []
     for name, active, text in (
-        ("failing", failing, f"Shiller valuation data fetch has failed on {fail_days} different days"),
+        ("failing", failing, f"Valuation data fetch (shillerdata.com, multpl.com and Yale) has failed on "
+                             f"{fail_days} different days"),
         ("stale", stale, f"Shiller's latest published earnings month is {stale_months} months old "
                          f"({raw.get('last_e')}); upstream may have stopped updating"),
     ):
+        if name == "stale" and not on_primary:
+            continue   # state unchanged while on a fallback
         if active and not notified.get(name):
             msgs.append(text)
             notified[name] = True
         elif not active:
             notified.pop(name, None)
+    extra = []
+    if not on_primary:
+        if notified.get("fallback") != source:
+            label = " and ".join(_FALLBACK_LABEL.get(x, x) for x in source.split("+"))
+            extra.append(f"\u2139\ufe0f PEC valuation series served by {label} fallback "
+                         f"\u2014 shillerdata.com unavailable since {raw.get('primary_down_since') or today.isoformat()}")
+            notified["fallback"] = source
+    elif notified.get("fallback"):
+        extra.append("\u2705 PEC valuation series back on shillerdata.com")
+        notified.pop("fallback", None)
     if notified != (raw.get("notified") if isinstance(raw.get("notified"), dict) else {}):
         raw["notified"] = notified
         try:
             _write_health(raw)
         except Exception as exc:  # pragma: no cover
             log.warning("[shiller] could not write notice marker: %s", exc)
-    if not msgs:
-        return None
-    return ("\u2139\ufe0f PEC: " + "; ".join(msgs)
-            + ". P/E, CAPE and earnings series are carried forward; see docs/plan.md Amendment C.\n")
+    out = ""
+    if msgs:
+        out += ("\u2139\ufe0f PEC: " + "; ".join(msgs)
+                + ". P/E, CAPE and earnings series are carried forward; see docs/plan.md Amendment C.\n")
+    for line in extra:
+        out += line + "\n"
+    return out or None
 
 
 # ---------------------------------------------------------------------------
@@ -481,13 +694,13 @@ def _series_from(eff: pd.DataFrame, series_id: str, today: Optional[date] = None
     return out.reset_index()
 
 
-def _check_range(series_id: str, df: pd.DataFrame) -> None:
+def _check_range(series_id: str, df: pd.DataFrame, label: str = "Shiller") -> None:
     lo, hi = _RANGES[series_id]
     bad = df[(df["value"] < lo) | (df["value"] > hi)]
     if not bad.empty:
         r = bad.iloc[-1]
         raise FetchError(
-            f"Shiller-derived '{series_id}' value {r['value']:.4f} on {r['date'].date()} outside "
+            f"{label}-derived '{series_id}' value {r['value']:.4f} on {r['date'].date()} outside "
             f"expected range [{lo}, {hi}] ({len(bad)} point(s)); refusing to publish"
         )
 
@@ -507,20 +720,22 @@ def _load_archive(key: str) -> tuple[pd.DataFrame, pd.Period]:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-def fetch(series_id: str, start_date: str = "2010-01-01", end_date: str = None, **kw) -> pd.DataFrame:
-    """
-    Return a DataFrame ['date', 'value'] (sorted, no NaN) for a Shiller-derived series.
+def _finish(out: pd.DataFrame, prov: pd.DataFrame, start_dt: pd.Timestamp, series_id: str,
+            source: str) -> pd.DataFrame:
+    out = out[["date", "value"]]
+    out = out[out["date"] >= start_dt]
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    out = out.dropna(subset=["value"]).sort_values("date", kind="stable").reset_index(drop=True)
+    if out.empty:
+        raise FetchError(f"{source} series '{series_id}' is empty for the requested start date")
+    pf = prov["date"].min() if len(prov) else None
+    out.attrs["provisional_from"] = pf.strftime("%Y-%m-%d") if pf is not None and pd.notna(pf) else None
+    out.attrs["source_used"] = source
+    return out
 
-    df.attrs['provisional_from'] holds the ISO date of the first provisional point
-    (or None). See the module header for splice and provisional rules.
-    """
-    if series_id not in _SERIES:
-        raise FetchError(f"shiller.fetch() supports {sorted(_SERIES)}, got '{series_id}'")
-    start_dt = pd.Timestamp(datetime.strptime(start_date, "%Y-%m-%d"))
-    today = (datetime.strptime(end_date, "%Y-%m-%d").date() if end_date
-             else datetime.now(_PT).date())
 
-    monthly = _get_monthly(today)
+def _from_workbook(monthly: pd.DataFrame, series_id: str, start_dt: pd.Timestamp, today: date,
+                   source: str) -> pd.DataFrame:
     eff = _derive(monthly, today)
     derived = _series_from(eff, series_id, today)
 
@@ -537,14 +752,53 @@ def fetch(series_id: str, start_date: str = "2010-01-01", end_date: str = None, 
         out = pd.concat([arch_df[arch_df["date"] <= cutoff_end], appended[["date", "value"]]],
                         ignore_index=True)
         prov = appended[appended["prov"]]
+    return _finish(out, prov, start_dt, series_id, source)
 
-    out = out[["date", "value"]]
-    out = out[out["date"] >= start_dt]
-    out["value"] = pd.to_numeric(out["value"], errors="coerce")
-    out = out.dropna(subset=["value"]).sort_values("date", kind="stable").reset_index(drop=True)
-    if out.empty:
-        raise FetchError(f"Shiller series '{series_id}' is empty for start {start_date}")
 
-    pf = prov["date"].min() if len(prov) else None
-    out.attrs["provisional_from"] = pf.strftime("%Y-%m-%d") if pf is not None and pd.notna(pf) else None
-    return out
+def fetch(series_id: str, start_date: str = "2010-01-01", end_date: str = None, **kw) -> pd.DataFrame:
+    """
+    Return a DataFrame ['date', 'value'] (sorted, no NaN) for a Shiller-derived series.
+
+    Source order per run: shillerdata.com -> multpl.com (not for nominal_earnings) -> Yale ->
+    FetchError. df.attrs['provisional_from'] holds the ISO date of the first provisional point
+    (or None); df.attrs['source_used'] is 'shiller', 'multpl' or 'yale'. See the module header
+    for splice and provisional rules.
+    """
+    if series_id not in _SERIES:
+        raise FetchError(f"shiller.fetch() supports {sorted(_SERIES)}, got '{series_id}'")
+    start_dt = pd.Timestamp(datetime.strptime(start_date, "%Y-%m-%d"))
+    today = (datetime.strptime(end_date, "%Y-%m-%d").date() if end_date
+             else datetime.now(_PT).date())
+    run = _run_state()
+
+    errors: list = []
+    source = None
+    try:
+        monthly = _get_primary(today)
+        source = "shiller"
+    except FetchError as exc:
+        errors.append(str(exc))
+        run["primary_failed"] = True
+        monthly = None
+
+    try:
+        if monthly is None and series_id in _MULTPL_IDS:
+            try:
+                result = _fetch_multpl(series_id, start_dt, today)
+                run["served"][series_id] = "multpl"
+                return result
+            except FetchError as exc:
+                errors.append(str(exc))
+        if monthly is None:
+            try:
+                monthly = _get_yale(today)
+                source = "yale"
+            except FetchError as exc:
+                errors.append(str(exc))
+                raise FetchError(f"Valuation sources unavailable for '{series_id}' - " + " | ".join(errors)) from exc
+        result = _from_workbook(monthly, series_id, start_dt, today, source)
+        run["served"][series_id] = source
+        return result
+    except FetchError:
+        run["failed"].append(series_id)
+        raise

@@ -131,7 +131,7 @@ series:
 
   # Section 5 Valuation strip - S&P 500 valuation metrics derived from Robert Shiller's
   # dataset (shillerdata.com ie_data.xls). Replaced multpl.com 2026-11-24 (docs/plan.md
-  # Amendment C). dividend_yield / pe / earnings_yield / cape keep the frozen multpl archive
+  # Amendment C; fallback order shillerdata.com -> multpl.com -> Yale, Amendment D). dividend_yield / pe / earnings_yield / cape keep the frozen multpl archive
   # (config/multpl_archive.json) through 2026-10 and append Shiller-derived months after it;
   # the two earnings series are rebuilt fully from Shiller. Latest months are provisional
   # (month-to-date S&P price, carried-forward D/E); output carries `provisional_from`.

@@ -221,6 +221,7 @@ def _fetch_standard(entry: dict, fetchers: dict) -> dict:
     # Shiller-derived valuation series flag their provisional tail (ISO date or None).
     if source == "shiller":
         out["provisional_from"] = df.attrs.get("provisional_from")
+        out["source_used"] = df.attrs.get("source_used")   # shiller | multpl | yale
     return out
 
 
@@ -345,8 +346,9 @@ def _append_factset_notice(fetchers: dict) -> None:
 
 def _append_shiller_notice(fetchers: dict) -> None:
     """
-    Append the once-per-condition Shiller health notice (failed on 2 distinct PT days, or the
-    latest published earnings month is over 5 months old) to eps_change.txt, which the
+    Append the once-per-condition valuation-source health notices (all sources failed on 2
+    distinct PT days; latest published earnings month over 5 months old; fallback source
+    serving / primary back) to eps_change.txt, which the
     workflow's Telegram step sends. The flag file name is kept for backward compatibility
     (it now carries any informational notice). Never raises.
     """
@@ -1053,6 +1055,8 @@ def run(filter_ids: Optional[list] = None, force: bool = False) -> None:
             n_obs = len(data["dates"])
             series_out[sid] = data
             statuses[sid]   = {"status": "ok", "last_fetched": now_ts, "last_attempt": now_ts}
+            if data.get("source_used"):
+                statuses[sid]["source_used"] = data["source_used"]
             log.info("[%s] OK — %d observations", sid, n_obs)
 
         except Exception as exc:

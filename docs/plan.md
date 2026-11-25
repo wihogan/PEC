@@ -282,3 +282,31 @@ Owner approved ("recommended defaults") replacing the five multpl.com series (do
 ### Amendment C — switched to production (2026-11-25)
 Owner approved the switch after QA re-check (MERGE). Merge 63c5bac; first production run 45690121543 succeeded and deployed: 42 series, 0 failures; all six Shiller-sourced series `ok`; November provisional values P/E 25.03, CAPE 38.23, EY 3.99 %, DY 1.11 %.
 Open follow-ups (not blocking): **N1** — the 15 % price sanity check drops a genuine >15 % crash month when Shiller has no row yet (point reappears once Shiller publishes); **m3** — an out-of-range derived value freezes the series until the 2-day Shiller notice fires (deferred: surfaced by M3 notice; revisit if it occurs).
+
+
+## Amendment D (2026-11-25): source order Shiller -> multpl -> Yale
+
+Owner-delegated decision (orchestrator, 2026-11-25). Branch `multpl-fallback`. Source order per run for the valuation series: **shillerdata.com (primary) -> multpl.com (first fallback) -> Yale `ie_data.xls` (last; still rejected when its last earnings month is more than 9 months old) -> fail closed (carry-forward).**
+
+### Rationale
+- multpl republishes Shiller's data, so it is the closest equivalent when shillerdata.com fails, and it keeps continuity with the frozen archive (which is multpl's).
+- Verified agreement Sep/Oct 2026 within tolerance: CAPE 40.12 vs 40.13, P/E 25.95 vs 25.96, earnings yield 3.85 % vs 3.85 %, dividend yield 1.07 % vs 1.07 %.
+- Yale is stale (ends 2023-09) and is useful only if it is updated again, so it goes last.
+- multpl.com has been down since 2026-11-23 (Amendment B); while it is down the order behaves exactly as Amendment C (one refused request, then Yale, then carry-forward).
+
+### Behaviour
+- The order is per run and shared by the six series: each source is tried at most once (negative-cached): one landing + workbook attempt, one Yale attempt, and multpl at most once per series, with the first network-level multpl failure (refused, timeout, HTTP error, budget exhausted) marking multpl down for all remaining series. All network stages share the 90 s budget; timeouts (10 s connect, 30 s read) are clamped to what is left.
+- multpl covers `dividend_yield`, `pe`, `earnings_yield`, `cape`, `real_earnings` (slugs in `fetchers/multpl.py`). `nominal_earnings` has no multpl equivalent: it goes to Yale, then fails closed.
+- Parsing reuses `fetchers.multpl._parse_html` through the new `multpl.fetch_live()`, which skips multpl's mtime HTML cache (no read, no write: runners are ephemeral and a stale cache would hide an outage) and returns an `estimate` flag per row (the dagger).
+- Splice (four ratio series): archive rows up to and including 2026-10 unchanged; multpl rows strictly after 2026-10 appended, one row per month (latest-dated row of the month wins), date conventions identical to the Shiller path (first-of-month for P/E, earnings yield, CAPE; month-end for dividend yield, clamped to today for the in-progress month). Range checks as for Shiller values apply to the appended rows.
+- `real_earnings` on multpl: multpl's whole `s-p-500-earnings` series from `start_date`, on **multpl's own basis**; unlike the Shiller path it is not re-based to the latest CPI month, so recent values can differ from the Shiller-path series (and multpl's earnings lag, so its last row can be several months old; accepted up to 9 months, ratio series up to 3).
+- Provisional on multpl: any row of the current month, or a dagger row in the last 3 months; `provisional_from` is the first such date.
+- Output: `source_used` (`shiller` | `multpl` | `yale`) beside `provisional_from` in each series of `data_v2.json`, in `metadata.statuses[sid]`, and in `health.json` series entries.
+- Not changed: a derived-value range failure or stale Shiller prices on a workbook that did load still fails closed (no cross-source retry).
+
+### Health and notices
+`.cache/shiller_health.json` gains `source` (`shiller`, `multpl`, `yale`, or `multpl+yale`) and `primary_down_since`. The run outcome is finalised in `pending_notice()` at the end of the run: a day counts as failing only when no series was served by any source. One-time Telegram info: "ℹ️ PEC valuation series served by multpl.com fallback — shillerdata.com unavailable since D" (re-sent if the fallback changes) and "✅ PEC valuation series back on shillerdata.com" (re-armed on change). The 2-failing-days notice now means all sources failed; the stale-earnings notice is evaluated only while the primary serves (last earnings month stops advancing on a fallback).
+
+### Runbook
+Freshness (`docs/runbook.md` section 1) and alerts (section 2) updated for the new source order and the three messages.
+
