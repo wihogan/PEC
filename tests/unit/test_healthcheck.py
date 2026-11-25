@@ -1,6 +1,7 @@
 """healthcheck.py (plan §5, §6.1).
 
-Pass fixture: tests/fixtures/baseline_data_v2.json with tips_5yr made fresh (one new
+Pass fixture: tests/fixtures/baseline_data_v2.json (a copy extended to the config's ids via
+conftest.baseline_for_config: sp500_earnings_nominal stands in from sp500_earnings) with tips_5yr made fresh (one new
 observation on 2026-11-19, status ok, last_fetched == last_refreshed), rendered once per
 session to PEC.html via refresh_v2.render. Mutation cases re-render so rule 3 stays
 consistent unless the test targets rule 3. Clock: 2026-11-20 15:00 PT.
@@ -19,7 +20,7 @@ import re
 import tempfile
 from pathlib import Path
 
-from conftest import FIXTURES, REAL_CONFIG as _LIVE_CONFIG, TEMPLATE
+from conftest import FIXTURES, REAL_CONFIG as _LIVE_CONFIG, TEMPLATE, baseline_for_config
 
 NOW = datetime.fromisoformat("2026-11-20T15:00:00-08:00")
 TODAY = NOW.date()
@@ -45,6 +46,7 @@ def _config_matching_baseline() -> Path:
 
 REAL_CONFIG = _config_matching_baseline()
 CFG = refresh_v2._load_config(REAL_CONFIG)
+RAW = baseline_for_config(CFG)
 FREQ = {e["id"]: e["refresh_frequency"] for e in CFG["series"]}
 SOURCE = {e["id"]: e["source"] for e in CFG["series"]}
 
@@ -352,16 +354,16 @@ def test_rule4_treasury_error_but_fresh_passes(mutated):
     assert any(w.startswith("yield_curve errored") for w in r["warnings"])
 
 
-def test_rule4_all_multpl_failed_warn_only(mutated):
-    ids = [s for s, src in SOURCE.items() if src == "multpl"]
-    assert len(ids) == 5
+def test_rule4_all_shiller_failed_warn_only(mutated):
+    ids = [s for s, src in SOURCE.items() if src == "shiller"]
+    assert len(ids) == 6
 
     def fn(d):
         for sid in ids:
             set_status(d, sid, "error")
     r = check(mutated(fn))
     assert r["failures"] == []
-    assert sum("errored" in w for w in r["warnings"]) == 5
+    assert sum("errored" in w for w in r["warnings"]) == 6
 
 
 def test_rule4_attempted_definition(mutated):
@@ -481,7 +483,12 @@ def test_rule6_compares_against_given_config(pass_files, tmp_path):
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "sid, quiet_age, warn_age",
-    [("cpi_yoy", 110, 111), ("nber_recession", 110, 111), ("gdp_growth", 300, 301), ("sp500_earnings", 220, 221)],
+    [
+        ("cpi_yoy", 110, 111), ("nber_recession", 110, 111), ("gdp_growth", 300, 301),
+        # Amendment C: first-of-month Shiller rows warn after 40 d; month-end ones after 7 d
+        ("sp500_pe", 40, 41), ("sp500_earnings_yield", 40, 41), ("shiller_cape", 40, 41),
+        ("sp500_dividend_yield", 7, 8), ("sp500_earnings", 7, 8), ("sp500_earnings_nominal", 7, 8),
+    ],
 )
 def test_slow_series_warn_thresholds(mutated, sid, quiet_age, warn_age):
     r = check(mutated(lambda d: set_last_obs(d, sid, days_ago(quiet_age))))
@@ -571,7 +578,7 @@ def test_rule4_counts_daily_release_and_intraday_not_after_close(mutated):
     assert rules(r) == ["rule 4"] and "4 market_daily series failed" in r["failures"][0]
 
 
-@pytest.mark.parametrize("sid", ["sp500_pe", "shiller_cape", "sp500_dividend_yield", "sp500_earnings_yield"])
+@pytest.mark.parametrize("sid", ["sp500_dividend_yield", "sp500_earnings", "sp500_earnings_nominal"])
 def test_daily_after_close_warn_only_after_7_days(mutated, sid):
     r = check(mutated(lambda d: set_last_obs(d, sid, days_ago(7))))
     assert not [w for w in r["warnings"] if w.startswith(f"{sid} last observation")]
@@ -580,9 +587,32 @@ def test_daily_after_close_warn_only_after_7_days(mutated, sid):
     assert f"{sid} last observation is 400 days old (warn > 7)" in r["warnings"]
 
 
-def test_sp500_earnings_keeps_220_day_warning(mutated):
-    r = check(mutated(lambda d: set_last_obs(d, "sp500_earnings", days_ago(100))))
-    assert not [w for w in r["warnings"] if w.startswith("sp500_earnings last observation")]
+def test_amendment_c_warn_thresholds():
+    t = healthcheck.THRESHOLDS
+    assert t["warn_by_id"] == {"sp500_pe": 40, "sp500_earnings_yield": 40, "shiller_cape": 40}
+    assert "sp500_earnings" not in t["warn_by_id"]                 # 220-day override dropped
+    assert t["warn_by_frequency"]["daily_after_close"] == 7
+
+
+@pytest.mark.parametrize("sid", ["sp500_pe", "sp500_earnings_yield", "shiller_cape"])
+def test_first_of_month_shiller_series_warn_after_40_days(mutated, sid):
+    r = check(mutated(lambda d: set_last_obs(d, sid, days_ago(40))))
+    assert not [w for w in r["warnings"] if w.startswith(f"{sid} last observation")]
+    r = check(mutated(lambda d: set_last_obs(d, sid, days_ago(400))))
+    assert r["failures"] == []
+    assert f"{sid} last observation is 400 days old (warn > 40)" in r["warnings"]
+
+
+def test_sp500_earnings_nominal_required_by_rule2(mutated):
+    r = check(mutated(lambda d: d["series"].pop("sp500_earnings_nominal")))
+    assert "rule 2: missing series ids: sp500_earnings_nominal" in r["failures"]
+
+
+def test_provisional_from_key_is_ignored_by_healthcheck(mutated):
+    def fn(d):
+        d["series"]["sp500_pe"]["provisional_from"] = "2026-11-01"
+        d["series"]["sp500_earnings_nominal"]["provisional_from"] = None
+    assert check(mutated(fn))["failures"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -733,3 +763,58 @@ def test_calendar_end_warning(pass_files):
     assert not [w for w in r["warnings"] if w.startswith("market_calendar")]
     r = check(pass_files, now=datetime.combine(end - timedelta(days=60), datetime.min.time()).astimezone())
     assert f"market_calendar covers NYSE holidays only to {end.isoformat()} (60 days left); add the next year to market_calendar.py" in r["warnings"]
+
+
+
+# ---------------------------------------------------------------------------
+# Rule 2: newly configured id not yet populated -> warning (Shiller QA fixes)
+# ---------------------------------------------------------------------------
+NEW_ID = "sp500_earnings_nominal"
+
+
+@pytest.mark.parametrize(
+    "status, fails",
+    [
+        ({"status": "error", "error": "Shiller workbook unavailable", "last_attempt": "x"}, False),
+        (None, False),                                   # status absent
+        ({"last_fetched": None}, False),                 # status record without 'status' -> error
+        ({"status": "ok", "last_fetched": "2026-11-20T14:18:11"}, True),
+        ({"status": "warning"}, True),
+    ],
+)
+def test_rule2_missing_id_warn_vs_fail(mutated, status, fails):
+    def fn(d):
+        d["series"].pop(NEW_ID)
+        d["metadata"]["statuses"].pop(NEW_ID, None)
+        if status is not None:
+            d["metadata"]["statuses"][NEW_ID] = status
+    r = check(mutated(fn))
+    if fails:
+        assert r["failures"] == [f"rule 2: missing series ids: {NEW_ID}"]
+        assert not [w for w in r["warnings"] if w.startswith("new series not yet populated")]
+    else:
+        assert r["failures"] == []
+        assert f"new series not yet populated: {NEW_ID}" in r["warnings"]
+
+
+def test_rule2_mixed_missing_ids(mutated):
+    def fn(d):
+        for sid in (NEW_ID, "nasdaq"):
+            d["series"].pop(sid)
+        d["metadata"]["statuses"][NEW_ID] = {"status": "error", "error": "boom"}
+        d["metadata"]["statuses"]["nasdaq"] = {"status": "ok"}
+        d["metadata"]["statuses"].pop("sp500_pe", None)
+        d["series"].pop("sp500_pe")
+    r = check(mutated(fn))
+    assert [f for f in r["failures"] if f.startswith("rule 2")] == ["rule 2: missing series ids: nasdaq"]
+    assert "rule 5: nasdaq has no observations" in r["failures"]          # daily id: rule 5 too
+    assert f"new series not yet populated: {NEW_ID}, sp500_pe" in r["warnings"]
+
+
+def test_rule2_unknown_id_still_fails_alongside_warning(mutated):
+    def fn(d):
+        d["series"].pop(NEW_ID)
+        d["metadata"]["statuses"].pop(NEW_ID, None)
+        d["series"]["bogus"] = {"dates": [], "values": []}
+    r = check(mutated(fn))
+    assert r["failures"] == ["rule 2: unknown series ids: bogus"]

@@ -6,7 +6,7 @@ import yaml
 
 import refresh_v2
 from conftest import REAL_CONFIG
-from fetchers import multpl
+from fetchers import shiller
 
 REQUIRED_FIELDS = ("id", "source", "series_id", "label", "category", "start_date", "refresh_frequency")
 FREQUENCIES = {"intraday", "daily_release", "daily_after_close", "monthly", "quarterly"}
@@ -27,10 +27,11 @@ def test_config_loads_with_series_and_valuation_inputs(config):
     assert "forward_eps_ntm" in config["valuation_inputs"]
 
 
-def test_41_unique_series_ids(config):
+def test_unique_series_ids(config):
+    """42 ids after Amendment C (sp500_earnings_nominal added)."""
     ids = [e["id"] for e in config["series"]]
-    assert len(ids) == 41
-    assert len(set(ids)) == 41
+    assert len(ids) == len(set(ids)) == 42
+    assert "sp500_earnings_nominal" in ids
 
 
 def test_registry_keys(registry):
@@ -40,7 +41,7 @@ def test_registry_keys(registry):
 def test_every_source_is_registered(config, registry):
     sources = {e["source"] for e in config["series"]}
     assert sources <= set(registry)
-    assert sources == {"fred", "yahoo", "treasury", "multpl"}  # shiller unused (N10)
+    assert sources == {"fred", "yahoo", "treasury", "shiller"}  # multpl retired (Amendment C)
 
 
 @pytest.mark.parametrize("field", REQUIRED_FIELDS)
@@ -64,9 +65,17 @@ def test_yoy_pct_only_on_fred(config):
             assert e["source"] == "fred", e["id"]
 
 
-def test_multpl_series_ids_supported(config):
-    ids = {e["series_id"] for e in config["series"] if e["source"] == "multpl"}
-    assert ids == set(multpl._SERIES)
+def test_shiller_series_ids_supported(config):
+    ids = {e["series_id"] for e in config["series"] if e["source"] == "shiller"}
+    assert ids == set(shiller._SERIES)
+
+
+def test_shiller_series_mapping(config):
+    m = {e["id"]: e["series_id"] for e in config["series"] if e["source"] == "shiller"}
+    assert m == {
+        "sp500_dividend_yield": "dividend_yield", "sp500_pe": "pe", "sp500_earnings_yield": "earnings_yield",
+        "sp500_earnings": "real_earnings", "sp500_earnings_nominal": "nominal_earnings", "shiller_cape": "cape",
+    }
 
 
 def test_treasury_series_id(config):
@@ -103,7 +112,7 @@ def test_amendment_b_frequency_mapping(config):
         by.setdefault(e["refresh_frequency"], set()).add(e["id"])
     src = {e["id"]: e["source"] for e in config["series"]}
     assert by["intraday"] == {i for i, s in src.items() if s == "yahoo"} and len(by["intraday"]) == 14
-    assert by["daily_after_close"] == {i for i, s in src.items() if s == "multpl"} and len(by["daily_after_close"]) == 5
+    assert by["daily_after_close"] == {i for i, s in src.items() if s == "shiller"} and len(by["daily_after_close"]) == 6
     assert by["monthly"] == {"cpi_yoy", "nber_recession"}
     assert by["quarterly"] == {"gdp_growth", "consumer_delinquency", "auto_loan_delinquency", "credit_card_delinquency"}
     assert "yield_curve" in by["daily_release"]

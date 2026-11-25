@@ -343,3 +343,30 @@ def test_state_optional_files_replaced_on_next_save(repo, tmp_path):
     sha, tree = _tree(repo)
     assert tree == ["data_v2.json", HIST]                      # orphan replace: FSC dropped
     assert json.loads(_git(repo, "show", f"{sha}:{HIST}").stdout) == {"n": 2}
+
+
+
+# ---------------------------------------------------------------------------
+# state.sh: optional .cache/shiller_health.json (Shiller QA M3)
+# ---------------------------------------------------------------------------
+SHH = "shiller_health.json"
+
+
+@pytest.mark.parametrize("present", [(SHH,), (HIST, FSC, SHH), ()])
+def test_state_shiller_health_round_trip(repo, tmp_path, present):
+    (repo / "data_v2.json").write_text('{"v": 7}')
+    for name in present:
+        _write_cache(repo, name, {"name": name, "fail_days": 1})
+    assert _sh(STATE_SH, repo, "save", "state-test").returncode == 0
+    sha, tree = _tree(repo)
+    assert tree == sorted(["data_v2.json", *present])
+
+    fresh = _clone(tmp_path, repo, "fresh")
+    r = _sh(STATE_SH, fresh, "restore", "state-test")
+    assert r.returncode == 0, r.stderr
+    p = fresh / ".cache" / SHH
+    if SHH in present:
+        assert json.loads(p.read_text()) == {"name": SHH, "fail_days": 1}
+        assert f"restored .cache/{SHH}" in r.stdout
+    else:
+        assert not p.exists() and f"{SHH} not on 'state-test' (ok)" in r.stdout

@@ -199,13 +199,16 @@ render(): PECtemplate.html + str.replace(__DASHBOARD_DATA__, raw_json) → PEC.h
 | russell_2000 | yahoo | ^RUT | Russell 2000 | market_daily | |
 | developed_ex_us_efa | yahoo | EFA | Developed ex-US (EFA) | market_daily | |
 | emerging_markets_eem | yahoo | EEM | Emerging Markets (EEM) | market_daily | |
-| sp500_dividend_yield | multpl | sp500_div_yield | S&P 500 Dividend Yield | monthly | ✓ |
-| sp500_pe | multpl | sp500_pe | S&P 500 Trailing P/E | monthly | |
-| sp500_earnings_yield | multpl | sp500_earnings_yield | S&P 500 Earnings Yield | monthly | |
-| sp500_earnings | multpl | sp500_earnings | S&P 500 TTM Earnings | monthly | |
-| shiller_cape | multpl | shiller_pe | Shiller CAPE | monthly | ✓ |
+| sp500_dividend_yield | shiller | dividend_yield | S&P 500 Dividend Yield | daily_after_close | ✓ |
+| sp500_pe | shiller | pe | S&P 500 Trailing P/E | daily_after_close | |
+| sp500_earnings_yield | shiller | earnings_yield | S&P 500 Earnings Yield | daily_after_close | |
+| sp500_earnings | shiller | real_earnings | S&P 500 TTM Earnings (real, latest-month dollars) | daily_after_close | |
+| sp500_earnings_nominal | shiller | nominal_earnings | S&P 500 TTM Earnings (nominal) - not shown in UI | daily_after_close | |
+| shiller_cape | shiller | cape | Shiller CAPE | daily_after_close | ✓ |
 
-**multpl note:** Percentage series (`sp500_div_yield`, `sp500_earnings_yield`) are stored as decimals (e.g. 0.0107 = 1.07%). The render layer multiplies by 100 for display. The `sp500_pe`, `sp500_earnings`, and `shiller_pe` series are stored as-is (ratios/dollars).
+**Shiller note (2026-11-24, plan.md Amendment C; replaces multpl):** these series come from `fetchers/shiller.py` (shillerdata.com `ie_data.xls`, discovered from the landing page). dividend_yield/pe/earnings_yield/cape keep the frozen multpl archive (`config/multpl_archive.json`) through 2026-10 and append Shiller-derived months; the earnings series are rebuilt fully from Shiller. Latest months are provisional and each series carries `provisional_from`. `fetchers/multpl.py` is unused. The older text below describing multpl/Yale is historical.
+
+**multpl note (historical):** Percentage series (`sp500_div_yield`, `sp500_earnings_yield`) are stored as decimals (e.g. 0.0107 = 1.07%). The render layer multiplies by 100 for display. The `sp500_pe`, `sp500_earnings`, and `shiller_pe` series are stored as-is (ratios/dollars).
 
 **sp500 start_date:** Extended to `1999-01-01` (vs 2010 for others) to support the "Max" range selector. `sp500_pe` and `shiller_cape` use `1980-01-01`.
 
@@ -342,6 +345,8 @@ Raise `FetchError` (from `fetchers/base.py`) for any failure. Always chain origi
 ---
 
 ### shiller.py
+
+**UPDATE 2026-11-24:** rewritten - now the source for all six valuation series above (see Amendment C in docs/plan.md and the module header). The paragraph below is historical.
 
 **NOTE: As of May 2026, this fetcher is superseded by `multpl.py` for Shiller CAPE.** The `shiller_cape` series now uses `source: multpl` and `series_id: shiller_pe`. The `shiller.py` file still exists but is not called by the current `series_v2.yaml`. Retained in case the multpl source fails.
 

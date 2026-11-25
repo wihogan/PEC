@@ -82,7 +82,7 @@ Known pre-existing latency (N16, tell Hogan, not changed): monthly series refres
 
 Hard fail (exit 1) if any:
 1. `data_v2.json` missing/invalid.
-2. Series ids ≠ the 41 in `series_v2.yaml` (+ `fwd_pe_history` allowed).
+2. Series ids ≠ the 42 in `series_v2.yaml` (+ `fwd_pe_history` allowed).
 3. `PEC.html` < 1.5 MB, or still contains `__DASHBOARD_DATA__`/`__GENERATED_AT__` outside the comment, or the `<script id="pec-data">` body does not parse to JSON equal to `data_v2.json`.
 4. Source-level failure, over **attempted** series this run: > 3 failed `market_daily` series; or all attempted FRED series failed (≥ 3 attempted); or all attempted Yahoo series failed (≥ 3 attempted). Treasury and multpl failures are governed by staleness only.
 5. Staleness (age of last non-null obs, calendar days) for daily series: `market_daily` 7; FRED FX and `wti_crude` 14 (weekly FRED batches, NB2); `yield_curve` 7. Final values confirmed from spike evidence (Phase 3) before Phase 4. Any one over threshold fails.
@@ -96,7 +96,7 @@ On the zip baseline at 2026-11-20: rule 5 flags `tips_5yr` (17 d) → **fail**. 
 
 ### 6.1 Unit (offline, every push; written by Opus)
 Isolation (N9): autouse fixture monkeypatches `refresh_v2.HERE/CONFIG_PATH/OUTPUT_PATH/BACKUP_DIR`, `spglobal._CACHE_DIR/_HISTORY_JSON/_SEED_YAML/_CACHE_JSON/_CACHE_XLSX` to `tmp_path`; sockets disabled. First Phase 2 task: confirm `import refresh_v2` works under pytest capture (`sys.stdout.reconfigure`, `logging.basicConfig`).
-- Config: loads; 41 unique ids; sources ⊂ registry; required fields.
+- Config: loads; 42 unique ids; sources ⊂ registry; required fields.
 - `_safe_float`, `_dates_to_strings`: NaN, None, inf, 4 dp.
 - `_needs_refresh`, `_last_completed_business_day`, `_market_is_open`: frozen clock via `datetime` subclass monkeypatch (Cut 10); each frequency; open/closed; pre/post close; weekend; month and quarter boundaries; under `TZ=America/Los_Angeles` and `TZ=UTC` (`time.tzset`).
 - `_compute_derived_valuation`: fwd P/E; DDM 4968 (EPS 354.84, 10y 4.00); denom ≤ 0 → None; both delta strings; month join; < 24 months → no fwdpe delta.
@@ -243,3 +243,38 @@ FactSet Earnings Insight (weekly PDF; `https://www.factset.com/earningsinsight` 
 - **M5:** FactSet cache is reused only if fetched today after 13:00 PT and as_of is under 6 days old; FactSet errors are recorded under `forward_eps_ntm` in statuses; one Telegram info message when FactSet failed on 2 consecutive PT days or as_of is over 10 days old.
 - **m1/m2:** `state_ref=state` only from `main`; `deploy` forced false for `state-test`. **m4:** Node 24 action majors. **m5:** healthcheck warning 60 days before `market_calendar.CALENDAR_YEARS` ends. **m6:** `refresh.log` leak-scanned; artifact upload only if the scan passes. **m10:** no EPS message when the rounded value is unchanged; sent after the state is saved. **m11:** EPS history is written for FactSet and override values; the in-progress month is dated `as_of`/today and re-dated to the month-end once the month has ended. **m12:** unparseable stamps count as never fetched. **m13/m14:** CI on pushes to any branch. **m3 (revisions):** resolved by owner decision 2026-11-24 — weekly re-check (see below).
 - Owner decision 2026-11-24: monthly/quarterly re-checked weekly after the period's print arrives, to pick up revisions (QA m3)
+
+
+## Amendment C (2026-11-24): multpl replaced by Shiller dataset
+
+Owner approved ("recommended defaults") replacing the five multpl.com series (down since Amendment B) with Shiller's own workbook. Branch `shiller-replace`.
+
+### Probe evidence (GitHub runner, run 45549962904 + follow-up, 2026-11-24)
+- https://shillerdata.com/ returns 200 and links the workbook with protocol-relative, versioned hrefs (`//img1.wsimg.com/blobby/go/.../downloads/<uuid>/ie_data.xls?ver=...`); the link is discovered each run by matching `ie_data.xls` and prefixing `https:`. The other linked file `Fig3-1 (1).xls` is not the dataset.
+- Workbook sheet "Data", header row index 7; columns `Date, P, D, E, CPI, Fraction, Rate GS10, Price, Dividend, Price, Earnings, Earnings, CAPE, nan, TR CAPE, ...` (duplicate names: select by position P=1, D=2, E=3, CPI=4; CAPE by exact header "CAPE", not "TR CAPE"). Date is a decimal year-month (2026.1 = October; month = round(frac*100)).
+- Latest rows: P/CPI/CAPE through 2026.11 (Nov provisional), D/E through 2026.09 (blank for 2026.10-11). 2026.09: P 7669.414, D 81.9895, E 295.5184, CPI 337.511, CAPE 40.268; 2026.10: P 7726.693, CPI 338.7765, CAPE 40.117; 2026.11: P 7619.38, CPI 339.40925, CAPE 39.374.
+- Matches multpl: CAPE Oct 40.117 vs 40.13; Sep PE 25.95 vs 25.96; Sep EY 3.853% vs 3.85%; Sep DY 1.069% vs 1.07%; E Dec-2022 172.75 vs 172.73; Dec-2023 192.43 vs 192.40. Older months differ (Aug PE multpl 26.11 vs Shiller 27.10) because multpl captured pre-revision vintages.
+- Yale `ie_data.xls` is reachable but stale (ends 2023.09): fallback only, rejected if the last E month is more than 9 months old.
+
+### Decisions
+- Current month price = month-to-date average of daily ^GSPC closes (Yahoo, fetched inside the fetcher; falls back to Shiller's P if that fails); prior months use Shiller's P. Labelled provisional.
+- Months with blank D/E (latest 1-3): carry forward the last published D and E (provisional).
+- CAPE: Shiller's for published months; current month with our price = CAPE_m x P_ours / P_shiller_m; with no Shiller row yet = (P_ours/CPI_est) / (P_prev/CPI_prev/CAPE_prev), CPI_est = latest Shiller CPI.
+- `sp500_earnings` stays inflation-adjusted: E_m x CPI_latest / CPI_m (re-based each month); label now says real / latest-month dollars. New series `sp500_earnings_nominal` (Shiller E as published), no UI.
+- No ETF proxy, no paid source. Percent series stay decimals.
+- Output carries `provisional_from` (ISO date of the first provisional point or null) on each of the six series. No UI change (the KPI tiles show no date; nothing to suffix).
+
+### Splice rule
+`dividend_yield`, `pe`, `earnings_yield`, `shiller_cape` keep the frozen multpl archive (`config/multpl_archive.json`, extracted verbatim from `tests/fixtures/baseline_data_v2.json`) for all rows up to and including 2026-10, including the two October rows (the later October row is multpl's in-month estimate); Shiller-derived months are appended strictly after 2026-10. The two earnings series are rebuilt fully from Shiller (mixing CPI bases is invalid). Date conventions follow the archive: pe/cape/earnings yield first-of-month; dividend yield and earnings month-end.
+
+### Other
+- Expected-range checks on Shiller-derived values (fail closed -> FetchError -> carry-forward): PE 8-60, CAPE 5-60, DY 0.5-8%, EY 1.5-15%, nominal EPS 10-600 (real EPS 10-800).
+- Healthcheck is config-driven (series count follows the YAML: 41 -> 42 ids, with `sp500_earnings_nominal`). Warn-only staleness: first-of-month series (pe, earnings yield, cape) warn after 40 days; the 220-day override for earnings is dropped because carried-forward E reaches the current month.
+- `fetchers/multpl.py` stays in the repo, unused.
+
+### QA fixes (docs/qa-shiller.md)
+- M1: every month after the archive cutoff (2026-10) uses our own monthly average of daily ^GSPC closes (one cached Yahoo call per run from the first day of the month after the cutoff); Shiller's P is only a fallback (or when ours is >15% from his). CAPE = Shiller CAPE_m x P_ours / P_shiller_m; a month with no Shiller row is synthesized like the current month (previous month's denominator, latest CPI), provisional. Ended months stay provisional while D/E are carried forward. No month-end jump: values change only when Shiller publishes.
+- M2: a failed workbook load is cached for the process (max one landing + one Yale attempt per run); timeouts connect 10 s / read 30 s; 90 s overall budget for all Shiller network work; the ^GSPC call is cached including failure.
+- M3: `.cache/shiller_health.json` (persisted on the state branch via tools/state.sh) drives a one-time Telegram notice (appended to `eps_change.txt`, name kept for compatibility) after 2 distinct failing PT days since the last success, or when Shiller's latest E is more than 5 months old; re-arms after recovery.
+- Healthcheck rule 2: an id missing from the output with status `error`/absent is a warning ("new series not yet populated"); missing with status `ok` still fails.
+- Licensing: shillerdata.com terms/robots not yet verified - owner to confirm; the workbook is downloaded once per trading day with an identifying User-Agent.

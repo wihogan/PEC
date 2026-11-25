@@ -1,3 +1,6 @@
+# NOTE (2026-11-24): UNUSED. multpl.com was replaced by fetchers/shiller.py (docs/plan.md
+# Amendment C). Kept in the repo for reference and its tests; not registered in series_v2.yaml.
+#
 # multpl.py — Fetches S&P 500 valuation metrics from multpl.com monthly tables.
 #
 # Source: https://www.multpl.com/{slug}/table/by-month

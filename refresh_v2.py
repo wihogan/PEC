@@ -214,10 +214,14 @@ def _fetch_standard(entry: dict, fetchers: dict) -> dict:
 
     df = module.fetch(**kwargs)
 
-    return {
+    out = {
         "dates":  _dates_to_strings(df),
         "values": [_safe_float(v) for v in df["value"].tolist()],
     }
+    # Shiller-derived valuation series flag their provisional tail (ISO date or None).
+    if source == "shiller":
+        out["provisional_from"] = df.attrs.get("provisional_from")
+    return out
 
 
 def _fetch_yield_curve(entry: dict, fetchers: dict) -> dict:
@@ -337,6 +341,26 @@ def _append_factset_notice(fetchers: dict) -> None:
             log.info("FactSet notice queued: %s", text.strip().splitlines()[0])
     except Exception as exc:  # pragma: no cover
         log.warning("Could not append FactSet notice: %s", exc)
+
+
+def _append_shiller_notice(fetchers: dict) -> None:
+    """
+    Append the once-per-condition Shiller health notice (failed on 2 distinct PT days, or the
+    latest published earnings month is over 5 months old) to eps_change.txt, which the
+    workflow's Telegram step sends. The flag file name is kept for backward compatibility
+    (it now carries any informational notice). Never raises.
+    """
+    try:
+        sh_mod = fetchers.get("shiller")
+        if sh_mod is None or not hasattr(sh_mod, "pending_notice"):
+            return
+        text = sh_mod.pending_notice()
+        if text:
+            with open(EPS_CHANGE_FLAG, "a", encoding="utf-8") as fh:
+                fh.write(text.rstrip("\n") + "\n")
+            log.info("Shiller notice queued: %s", text.strip().splitlines()[0])
+    except Exception as exc:  # pragma: no cover
+        log.warning("Could not append Shiller notice: %s", exc)
 
 
 def _fetch_valuation_inputs(
@@ -676,9 +700,9 @@ def _needs_refresh(
         trading day. A successful fetch stamped after the close is not enough, because
         Yahoo can deliver the day's bar hours late. The data-based re-fetch stops at
         18:00 PT on that trading day, after which the fetch-time rule applies.
-      * intraday crypto and daily_after_close (multpl): satisfied by fetch time
-        (a successful fetch at/after the last completed close). multpl is deliberately
-        not data-tested: its table is down/irregular and its row dates do not follow
+      * intraday crypto and daily_after_close (shiller): satisfied by fetch time
+        (a successful fetch at/after the last completed close). shiller is deliberately
+        not data-tested: its monthly row dates do not follow
         trading days, so a data test would poll it all evening.
 
     A series whose last status is "error" is never satisfied. Intraday,
@@ -1067,6 +1091,8 @@ def run(filter_ids: Optional[list] = None, force: bool = False) -> None:
                 "continuing without valuation_inputs block",
                 exc,
             )
+
+    _append_shiller_notice(fetchers)  # after the vi block (which resets eps_change.txt)
 
     # ------------------------------------------------------------------
     # Derived valuation inputs — computed from fetched series + vi_out

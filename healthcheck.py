@@ -17,7 +17,7 @@ Hard-fail rules:
      and the <script id="pec-data"> body parses to JSON equal to data_v2.json.
   4. Source-level failures over series attempted this run:
      > 3 failed intraday/daily_release series (reported as "market_daily"); all attempted FRED failed (>= 3 attempted);
-     all attempted Yahoo failed (>= 3 attempted). Treasury / multpl: staleness only.
+     all attempted Yahoo failed (>= 3 attempted). Treasury / shiller: staleness only.
   5. Staleness of daily series (calendar days since last non-null observation).
   6. valuation_inputs.forward_eps_ntm is the config override (source override), or a FactSet
      value (source factset) dated after the override's effective_date and within 200-600.
@@ -58,7 +58,8 @@ THRESHOLDS: dict = {
     },
     # Warn when age > value. Per-id entry wins over per-frequency entry.
     "warn_by_frequency": {"daily_after_close": 7, "monthly": 110, "quarterly": 300},
-    "warn_by_id": {"sp500_earnings": 220},
+    # Monthly valuation rows dated first-of-month (always include the current month): warn after 40d.
+    "warn_by_id": {"sp500_pe": 40, "sp500_earnings_yield": 40, "shiller_cape": 40},
     # Derived / valuation inputs (warn only).
     "warn_fwd_pe_history_days": 60,
     "warn_eps_effective_days": 45,
@@ -208,8 +209,15 @@ def run_checks(data_path: Path, html_path: Path, config_path: Path, now: datetim
         want = set(cfg_series)
         missing = sorted(want - got)
         extra = sorted(got - want)
-        if missing:
-            failures.append(f"rule 2: missing series ids: {', '.join(missing)}")
+        # A newly configured id that never fetched (status error or absent) is only a warning:
+        # the previous state cannot contain it. Missing with status ok would be a bug: fail.
+        new_unpopulated = [s for s in missing
+                           if (statuses.get(s) or {}).get("status", "error") == "error"]
+        hard_missing = [s for s in missing if s not in new_unpopulated]
+        if new_unpopulated:
+            warnings.append(f"new series not yet populated: {', '.join(new_unpopulated)}")
+        if hard_missing:
+            failures.append(f"rule 2: missing series ids: {', '.join(hard_missing)}")
         if extra:
             failures.append(f"rule 2: unknown series ids: {', '.join(extra)}")
 
