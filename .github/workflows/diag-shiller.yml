@@ -1,0 +1,43 @@
+name: diag-shiller
+on:
+  push:
+    branches: [shiller-replace]
+permissions:
+  contents: read
+env:
+  TZ: America/Los_Angeles
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: five fetches
+        run: |
+          python - <<'PY'
+          import logging, json
+          logging.basicConfig(level=logging.INFO)
+          from fetchers import shiller
+          arch = json.load(open('config/multpl_archive.json'))['series']
+          for sid in ['dividend_yield','pe','earnings_yield','real_earnings','nominal_earnings','cape']:
+              df = shiller.fetch(sid, '1980-01-01' if sid in ('pe','cape') else '2010-01-01')
+              print('=====', sid, len(df), 'provisional_from=', df.attrs.get('provisional_from'))
+              print(df.tail(6).to_string())
+              if sid in arch:
+                  a = dict(zip(arch[sid]['dates'], arch[sid]['values']))
+                  for d in sorted(a)[-4:]:
+                      print('  archive', d, a[d])
+          PY
+      - name: full refresh (no FRED key; FRED failures expected)
+        run: |
+          python refresh_v2.py --force 2>&1 | tail -80 || true
+          python - <<'PY'
+          import json
+          d = json.load(open('data_v2.json'))
+          for k in ['sp500_dividend_yield','sp500_pe','sp500_earnings_yield','sp500_earnings','sp500_earnings_nominal','shiller_cape']:
+              s = d['series'][k]; st = d['metadata']['statuses'][k]
+              print(k, st['status'], len(s['dates']), s['dates'][-2:], s['values'][-2:], 'prov=', s.get('provisional_from'))
+          PY

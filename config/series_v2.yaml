@@ -34,7 +34,7 @@
 #                       daily_release     — FRED daily series and yield_curve. Fetch every run while
 #                                           the stored last observation is older than the expected
 #                                           one (last completed trading day minus publish_lag_bd).
-#                       daily_after_close — multpl. Once per trading day at the first run after the
+#                       daily_after_close — shiller. Once per trading day at the first run after the
 #                                           close; retried on later runs if it failed.
 #                       monthly           — fetch (at most once per calendar day) until the most
 #                                           recently ended month's observation is present.
@@ -129,57 +129,69 @@ series:
     refresh_frequency: intraday
     notes:             "MSCI EM proxy via iShares EEM ETF. Complements existing VWO entry."
 
-  # Section 5 Valuation strip — S&P 500 valuation metrics via multpl.com.
-  # All four are monthly series sourced from Shiller's dataset (history to 1871).
+  # Section 5 Valuation strip - S&P 500 valuation metrics derived from Robert Shiller's
+  # dataset (shillerdata.com ie_data.xls). Replaced multpl.com 2026-11-24 (docs/plan.md
+  # Amendment C). dividend_yield / pe / earnings_yield / cape keep the frozen multpl archive
+  # (config/multpl_archive.json) through 2026-10 and append Shiller-derived months after it;
+  # the two earnings series are rebuilt fully from Shiller. Latest months are provisional
+  # (month-to-date S&P price, carried-forward D/E); output carries `provisional_from`.
   # Percentage series stored as decimals; render layer multiplies by 100 for display.
-  # Cache: .cache/multpl_{series_id}.html, 24-hour TTL.
 
   - id:                sp500_dividend_yield
-    source:            multpl
-    series_id:         sp500_div_yield
+    source:            shiller
+    series_id:         dividend_yield
     label:             "S&P 500 Dividend Yield"
     category:          equity
     start_date:        "2010-01-01"
     refresh_frequency: daily_after_close
     kpi:               true
-    notes:             "TTM dividend yield as decimal (e.g. 0.0107 = 1.07%). Source: multpl.com/s-p-500-dividend-yield"
+    notes:             "TTM dividend yield as decimal (e.g. 0.0107 = 1.07%) = Shiller D / P. multpl archive to 2026-10, Shiller after. Latest month provisional."
 
   - id:                sp500_pe
-    source:            multpl
-    series_id:         sp500_pe
+    source:            shiller
+    series_id:         pe
     label:             "S&P 500 Trailing P/E"
     category:          equity
     start_date:        "1980-01-01"
     refresh_frequency: daily_after_close
-    notes:             "Trailing 12-month P/E ratio. Source: multpl.com/s-p-500-pe-ratio"
+    notes:             "Trailing 12-month P/E = P / Shiller E. multpl archive to 2026-10, Shiller after. Latest month provisional."
 
   - id:                sp500_earnings_yield
-    source:            multpl
-    series_id:         sp500_earnings_yield
+    source:            shiller
+    series_id:         earnings_yield
     label:             "S&P 500 Earnings Yield"
     category:          equity
     start_date:        "2010-01-01"
     refresh_frequency: daily_after_close
-    notes:             "TTM earnings yield as decimal (e.g. 0.0317 = 3.17%). Source: multpl.com/s-p-500-earnings-yield"
+    notes:             "TTM earnings yield as decimal (e.g. 0.0317 = 3.17%) = Shiller E / P. multpl archive to 2026-10, Shiller after. Latest month provisional."
 
   - id:                sp500_earnings
-    source:            multpl
-    series_id:         sp500_earnings
-    label:             "S&P 500 TTM Earnings"
+    source:            shiller
+    series_id:         real_earnings
+    label:             "S&P 500 TTM Earnings (real, latest-month dollars)"
     category:          equity
     start_date:        "2010-01-01"
     refresh_frequency: daily_after_close
-    notes:             "Trailing 12-month EPS ($/share). Lags ~2 quarters. Source: multpl.com/s-p-500-earnings"
+    notes:             "Inflation-adjusted TTM EPS ($/share) = Shiller E x CPI_latest / CPI_m; re-based every month. Rebuilt fully from Shiller. Last published E carried forward for months Shiller has not yet published (provisional)."
+
+  - id:                sp500_earnings_nominal
+    source:            shiller
+    series_id:         nominal_earnings
+    label:             "S&P 500 TTM Earnings (nominal, as published)"
+    category:          equity
+    start_date:        "2010-01-01"
+    refresh_frequency: daily_after_close
+    notes:             "Nominal TTM EPS ($/share) as published by Shiller. Not displayed in the UI. Last published E carried forward for unpublished months (provisional)."
 
   - id:                shiller_cape
-    source:            multpl
-    series_id:         shiller_pe
+    source:            shiller
+    series_id:         cape
     label:             "Shiller CAPE"
     category:          equity
     start_date:        "1980-01-01"
     refresh_frequency: daily_after_close
     kpi:               true
-    notes:             "multpl.com/shiller-pe/table/by-month — sourced from Shiller dataset, current data. Yale ie_data.xls retired (stale after Sep 2023)."
+    notes:             "Shiller CAPE. multpl archive to 2026-10, Shiller after; current month = Shiller CAPE scaled by our month-to-date S&P price (provisional)."
 
   # ---------------------------------------------------------------------------
   # RATES

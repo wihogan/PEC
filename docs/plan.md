@@ -243,3 +243,31 @@ FactSet Earnings Insight (weekly PDF; `https://www.factset.com/earningsinsight` 
 - **M5:** FactSet cache is reused only if fetched today after 13:00 PT and as_of is under 6 days old; FactSet errors are recorded under `forward_eps_ntm` in statuses; one Telegram info message when FactSet failed on 2 consecutive PT days or as_of is over 10 days old.
 - **m1/m2:** `state_ref=state` only from `main`; `deploy` forced false for `state-test`. **m4:** Node 24 action majors. **m5:** healthcheck warning 60 days before `market_calendar.CALENDAR_YEARS` ends. **m6:** `refresh.log` leak-scanned; artifact upload only if the scan passes. **m10:** no EPS message when the rounded value is unchanged; sent after the state is saved. **m11:** EPS history is written for FactSet and override values; the in-progress month is dated `as_of`/today and re-dated to the month-end once the month has ended. **m12:** unparseable stamps count as never fetched. **m13/m14:** CI on pushes to any branch. **m3 (revisions):** resolved by owner decision 2026-11-24 — weekly re-check (see below).
 - Owner decision 2026-11-24: monthly/quarterly re-checked weekly after the period's print arrives, to pick up revisions (QA m3)
+
+
+## Amendment C (2026-11-24): multpl replaced by Shiller dataset
+
+Owner approved ("recommended defaults") replacing the five multpl.com series (down since Amendment B) with Shiller's own workbook. Branch `shiller-replace`.
+
+### Probe evidence (GitHub runner, run 45549962904 + follow-up, 2026-11-24)
+- https://shillerdata.com/ returns 200 and links the workbook with protocol-relative, versioned hrefs (`//img1.wsimg.com/blobby/go/.../downloads/<uuid>/ie_data.xls?ver=...`); the link is discovered each run by matching `ie_data.xls` and prefixing `https:`. The other linked file `Fig3-1 (1).xls` is not the dataset.
+- Workbook sheet "Data", header row index 7; columns `Date, P, D, E, CPI, Fraction, Rate GS10, Price, Dividend, Price, Earnings, Earnings, CAPE, nan, TR CAPE, ...` (duplicate names: select by position P=1, D=2, E=3, CPI=4; CAPE by exact header "CAPE", not "TR CAPE"). Date is a decimal year-month (2026.1 = October; month = round(frac*100)).
+- Latest rows: P/CPI/CAPE through 2026.11 (Nov provisional), D/E through 2026.09 (blank for 2026.10-11). 2026.09: P 7669.414, D 81.9895, E 295.5184, CPI 337.511, CAPE 40.268; 2026.10: P 7726.693, CPI 338.7765, CAPE 40.117; 2026.11: P 7619.38, CPI 339.40925, CAPE 39.374.
+- Matches multpl: CAPE Oct 40.117 vs 40.13; Sep PE 25.95 vs 25.96; Sep EY 3.853% vs 3.85%; Sep DY 1.069% vs 1.07%; E Dec-2022 172.75 vs 172.73; Dec-2023 192.43 vs 192.40. Older months differ (Aug PE multpl 26.11 vs Shiller 27.10) because multpl captured pre-revision vintages.
+- Yale `ie_data.xls` is reachable but stale (ends 2023.09): fallback only, rejected if the last E month is more than 9 months old.
+
+### Decisions
+- Current month price = month-to-date average of daily ^GSPC closes (Yahoo, fetched inside the fetcher; falls back to Shiller's P if that fails); prior months use Shiller's P. Labelled provisional.
+- Months with blank D/E (latest 1-3): carry forward the last published D and E (provisional).
+- CAPE: Shiller's for published months; current month with our price = CAPE_m x P_ours / P_shiller_m; with no Shiller row yet = (P_ours/CPI_est) / (P_prev/CPI_prev/CAPE_prev), CPI_est = latest Shiller CPI.
+- `sp500_earnings` stays inflation-adjusted: E_m x CPI_latest / CPI_m (re-based each month); label now says real / latest-month dollars. New series `sp500_earnings_nominal` (Shiller E as published), no UI.
+- No ETF proxy, no paid source. Percent series stay decimals.
+- Output carries `provisional_from` (ISO date of the first provisional point or null) on each of the six series. No UI change (the KPI tiles show no date; nothing to suffix).
+
+### Splice rule
+`dividend_yield`, `pe`, `earnings_yield`, `shiller_cape` keep the frozen multpl archive (`config/multpl_archive.json`, extracted verbatim from `tests/fixtures/baseline_data_v2.json`) for all rows up to and including 2026-10, including the two October rows (the later October row is multpl's in-month estimate); Shiller-derived months are appended strictly after 2026-10. The two earnings series are rebuilt fully from Shiller (mixing CPI bases is invalid). Date conventions follow the archive: pe/cape/earnings yield first-of-month; dividend yield and earnings month-end.
+
+### Other
+- Expected-range checks on Shiller-derived values (fail closed -> FetchError -> carry-forward): PE 8-60, CAPE 5-60, DY 0.5-8%, EY 1.5-15%, nominal EPS 10-600 (real EPS 10-800).
+- Healthcheck is config-driven (series count follows the YAML: 41 -> 42 ids, with `sp500_earnings_nominal`). Warn-only staleness: first-of-month series (pe, earnings yield, cape) warn after 40 days; the 220-day override for earnings is dropped because carried-forward E reaches the current month.
+- `fetchers/multpl.py` stays in the repo, unused.

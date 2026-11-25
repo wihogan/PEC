@@ -214,10 +214,14 @@ def _fetch_standard(entry: dict, fetchers: dict) -> dict:
 
     df = module.fetch(**kwargs)
 
-    return {
+    out = {
         "dates":  _dates_to_strings(df),
         "values": [_safe_float(v) for v in df["value"].tolist()],
     }
+    # Shiller-derived valuation series flag their provisional tail (ISO date or None).
+    if source == "shiller":
+        out["provisional_from"] = df.attrs.get("provisional_from")
+    return out
 
 
 def _fetch_yield_curve(entry: dict, fetchers: dict) -> dict:
@@ -676,9 +680,9 @@ def _needs_refresh(
         trading day. A successful fetch stamped after the close is not enough, because
         Yahoo can deliver the day's bar hours late. The data-based re-fetch stops at
         18:00 PT on that trading day, after which the fetch-time rule applies.
-      * intraday crypto and daily_after_close (multpl): satisfied by fetch time
-        (a successful fetch at/after the last completed close). multpl is deliberately
-        not data-tested: its table is down/irregular and its row dates do not follow
+      * intraday crypto and daily_after_close (shiller): satisfied by fetch time
+        (a successful fetch at/after the last completed close). shiller is deliberately
+        not data-tested: its monthly row dates do not follow
         trading days, so a data test would poll it all evening.
 
     A series whose last status is "error" is never satisfied. Intraday,

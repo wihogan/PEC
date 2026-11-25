@@ -17,7 +17,7 @@ Hard-fail rules:
      and the <script id="pec-data"> body parses to JSON equal to data_v2.json.
   4. Source-level failures over series attempted this run:
      > 3 failed intraday/daily_release series (reported as "market_daily"); all attempted FRED failed (>= 3 attempted);
-     all attempted Yahoo failed (>= 3 attempted). Treasury / multpl: staleness only.
+     all attempted Yahoo failed (>= 3 attempted). Treasury / shiller: staleness only.
   5. Staleness of daily series (calendar days since last non-null observation).
   6. valuation_inputs.forward_eps_ntm is the config override (source override), or a FactSet
      value (source factset) dated after the override's effective_date and within 200-600.
@@ -58,7 +58,8 @@ THRESHOLDS: dict = {
     },
     # Warn when age > value. Per-id entry wins over per-frequency entry.
     "warn_by_frequency": {"daily_after_close": 7, "monthly": 110, "quarterly": 300},
-    "warn_by_id": {"sp500_earnings": 220},
+    # Monthly valuation rows dated first-of-month (always include the current month): warn after 40d.
+    "warn_by_id": {"sp500_pe": 40, "sp500_earnings_yield": 40, "shiller_cape": 40},
     # Derived / valuation inputs (warn only).
     "warn_fwd_pe_history_days": 60,
     "warn_eps_effective_days": 45,
