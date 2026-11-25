@@ -58,7 +58,7 @@ land = fetch("https://shillerdata.com/")
 links = sorted(set(re.findall(r'href="([^"]+?\.xlsx?(?:\?[^"]*)?)"', land.text, flags=re.I))) if land.ok else []
 print("workbook links on landing page:", links)
 for l in links[:2]:
-    r = fetch(l if l.startswith("http") else "https://shillerdata.com" + l)
+    r = fetch("https:" + l if l.startswith("//") else (l if l.startswith("http") else "https://shillerdata.com" + l))
     if r.ok: analyse(f"shillerdata.com {l[:80]}", r.content)
 y = fetch("http://www.econ.yale.edu/~shiller/data/ie_data.xls")
 if y.ok: analyse("Yale ie_data.xls", y.content)
