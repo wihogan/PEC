@@ -763,3 +763,58 @@ def test_calendar_end_warning(pass_files):
     assert not [w for w in r["warnings"] if w.startswith("market_calendar")]
     r = check(pass_files, now=datetime.combine(end - timedelta(days=60), datetime.min.time()).astimezone())
     assert f"market_calendar covers NYSE holidays only to {end.isoformat()} (60 days left); add the next year to market_calendar.py" in r["warnings"]
+
+
+
+# ---------------------------------------------------------------------------
+# Rule 2: newly configured id not yet populated -> warning (Shiller QA fixes)
+# ---------------------------------------------------------------------------
+NEW_ID = "sp500_earnings_nominal"
+
+
+@pytest.mark.parametrize(
+    "status, fails",
+    [
+        ({"status": "error", "error": "Shiller workbook unavailable", "last_attempt": "x"}, False),
+        (None, False),                                   # status absent
+        ({"last_fetched": None}, False),                 # status record without 'status' -> error
+        ({"status": "ok", "last_fetched": "2026-11-20T14:18:11"}, True),
+        ({"status": "warning"}, True),
+    ],
+)
+def test_rule2_missing_id_warn_vs_fail(mutated, status, fails):
+    def fn(d):
+        d["series"].pop(NEW_ID)
+        d["metadata"]["statuses"].pop(NEW_ID, None)
+        if status is not None:
+            d["metadata"]["statuses"][NEW_ID] = status
+    r = check(mutated(fn))
+    if fails:
+        assert r["failures"] == [f"rule 2: missing series ids: {NEW_ID}"]
+        assert not [w for w in r["warnings"] if w.startswith("new series not yet populated")]
+    else:
+        assert r["failures"] == []
+        assert f"new series not yet populated: {NEW_ID}" in r["warnings"]
+
+
+def test_rule2_mixed_missing_ids(mutated):
+    def fn(d):
+        for sid in (NEW_ID, "nasdaq"):
+            d["series"].pop(sid)
+        d["metadata"]["statuses"][NEW_ID] = {"status": "error", "error": "boom"}
+        d["metadata"]["statuses"]["nasdaq"] = {"status": "ok"}
+        d["metadata"]["statuses"].pop("sp500_pe", None)
+        d["series"].pop("sp500_pe")
+    r = check(mutated(fn))
+    assert [f for f in r["failures"] if f.startswith("rule 2")] == ["rule 2: missing series ids: nasdaq"]
+    assert "rule 5: nasdaq has no observations" in r["failures"]          # daily id: rule 5 too
+    assert f"new series not yet populated: {NEW_ID}, sp500_pe" in r["warnings"]
+
+
+def test_rule2_unknown_id_still_fails_alongside_warning(mutated):
+    def fn(d):
+        d["series"].pop(NEW_ID)
+        d["metadata"]["statuses"].pop(NEW_ID, None)
+        d["series"]["bogus"] = {"dates": [], "values": []}
+    r = check(mutated(fn))
+    assert r["failures"] == ["rule 2: unknown series ids: bogus"]

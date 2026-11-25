@@ -58,14 +58,18 @@ class Net:
         self.routes = {shiller._LANDING_URL: FakeResp(text=LANDING), WB_URL: FakeResp(content=WB),
                        shiller._YALE_URL: FakeResp(content=WB_STALE)}
         self.calls = []
+        self.kwargs = []
 
     def __call__(self, url, **kw):
         self.calls.append(url)
+        self.kwargs.append(kw)
         r = self.routes.get(url)
         if r is None:
             raise requests.ConnectionError(f"no route to {url}")
         if isinstance(r, Exception):
             raise r
+        if callable(r):
+            return r()
         return r
 
 
@@ -98,21 +102,38 @@ def clock(monkeypatch):
     freeze_now(monkeypatch)
 
 
-def mtd(monkeypatch, closes, start="2026-11-02", prior=None):
+def mtd(monkeypatch, closes, start="2026-11-02", prior=None, tz=None):
     """yfinance.download stub returning daily closes (optionally a prior-month row first)."""
     idx = pd.bdate_range(start, periods=len(closes))
     data = list(closes)
     if prior is not None:
         idx = idx.insert(0, pd.Timestamp("2026-10-30"))
         data = [prior] + data
+    return yf_stub(monkeypatch, pd.Series(data, index=idx), tz=tz)
+
+
+def yf_stub(monkeypatch, closes: pd.Series, tz=None):
+    """yfinance.download stub returning `closes` (index = dates) as a Close column."""
     calls = []
+    idx = pd.DatetimeIndex(closes.index, name="Date")
+    if tz:
+        idx = idx.tz_localize(tz)
 
     def dl(ticker, **kw):
         calls.append((ticker, kw))
-        return pd.DataFrame({"Close": data, "Open": data}, index=pd.DatetimeIndex(idx, name="Date"))
+        return pd.DataFrame({"Close": list(closes.values), "Open": list(closes.values)}, index=idx)
 
     monkeypatch.setattr(yfinance, "download", dl)
     return calls
+
+
+def closes(spec):
+    """{'2026-11': [7600, 7700], ...} -> daily closes on the first business days of each month."""
+    parts = []
+    for month, vals in spec.items():
+        days = pd.bdate_range(pd.Period(month, "M").start_time, periods=len(vals))
+        parts.append(pd.Series(vals, index=days))
+    return pd.concat(parts)
 
 
 def parsed():
@@ -305,24 +326,48 @@ def test_parse_empty_columns(raw_frame):
 
 
 # ---------------------------------------------------------------------------
-# _mtd_price
+# _gspc_monthly: one cached ^GSPC download -> {Period: monthly average}
 # ---------------------------------------------------------------------------
-def test_mtd_average_excludes_prior_month(monkeypatch):
-    calls = mtd(monkeypatch, [7500.0, 7600.0, 7700.0], prior=9999.0)
-    assert shiller._mtd_price(TODAY) == pytest.approx(7600.0)
-    assert calls[0][0] == "^GSPC" and calls[0][1]["start"] == "2026-11-01"
-    assert shiller._mtd_price(TODAY) == pytest.approx(7600.0)
-    assert len(calls) == 1                                  # cached per month
+START = date(2026, 11, 1)
 
 
-@pytest.mark.parametrize("closes", [[], [50.0], [200000.0]])
-def test_mtd_empty_or_implausible_is_none(monkeypatch, closes):
-    mtd(monkeypatch, closes)
-    assert shiller._mtd_price(TODAY) is None
+def test_gspc_monthly_averages_per_month_excluding_earlier_rows(monkeypatch):
+    calls = yf_stub(monkeypatch, closes({"2026-10": [9999.0], "2026-11": [7500.0, 7700.0], "2026-12": [7800.0]}))
+    out = shiller._gspc_monthly(START)
+    assert out == {pd.Period("2026-11", "M"): pytest.approx(7600.0), pd.Period("2026-12", "M"): 7800.0}
+    ticker, kw = calls[0]
+    assert ticker == "^GSPC" and kw["start"] == "2026-11-01" and kw["auto_adjust"] is True
+    assert kw["timeout"] == pytest.approx(20.0, abs=0.5)
+    assert shiller._gspc_monthly(START) is out and len(calls) == 1    # one download per run
 
 
-def test_mtd_download_failure_is_none():
-    assert shiller._mtd_price(TODAY) is None               # autouse stub raises
+def test_gspc_monthly_tz_aware_index(monkeypatch):
+    yf_stub(monkeypatch, closes({"2026-10": [9999.0], "2026-11": [7500.0, 7700.0]}), tz="America/New_York")
+    assert shiller._gspc_monthly(START) == {pd.Period("2026-11", "M"): pytest.approx(7600.0)}
+
+
+def test_gspc_monthly_drops_implausible_months(monkeypatch):
+    yf_stub(monkeypatch, closes({"2026-11": [50.0], "2026-12": [7800.0]}))
+    assert shiller._gspc_monthly(START) == {pd.Period("2026-12", "M"): 7800.0}
+
+
+@pytest.mark.parametrize("spec", [{}, {"2026-11": [50.0]}, {"2026-10": [7600.0]}])
+def test_gspc_monthly_nothing_usable_is_none(monkeypatch, spec):
+    yf_stub(monkeypatch, closes(spec) if spec else pd.Series([], dtype=float))
+    assert shiller._gspc_monthly(START) is None
+
+
+def test_gspc_monthly_failure_cached(monkeypatch):
+    n = []
+
+    def boom(*a, **k):
+        n.append(1)
+        raise RuntimeError("yahoo down")
+
+    monkeypatch.setattr(yfinance, "download", boom)
+    assert shiller._gspc_monthly(START) is None
+    assert shiller._gspc_monthly(START) is None
+    assert len(n) == 1                                       # failure cached for the run
 
 
 # ---------------------------------------------------------------------------
@@ -497,15 +542,43 @@ def test_earnings_range_applies_from_start_date(monkeypatch, net, clock):
         shiller.fetch("nominal_earnings", start_date="1800-01-01", end_date=END)
 
 
-@pytest.mark.parametrize("sid", ["pe", "earnings_yield", "dividend_yield"])
-def test_range_check_on_derived_month_fails_closed(monkeypatch, net, clock, sid):
-    mtd(monkeypatch, [40000.0])                 # implausible MTD price -> PE 135, EY 0.7%, DY 0.2%
-    with pytest.raises(FetchError, match=f"Shiller-derived '{sid}' value .* outside expected range"):
+def _workbook_with(**sep):
+    """Parsed fixture with September (the last published D/E, carried into Oct/Nov) changed."""
+    m = parsed()
+    for col, v in sep.items():
+        m.loc[pd.Period("2026-09", "M"), col] = v
+    return m
+
+
+@pytest.mark.parametrize(
+    "sid, sep",
+    [("pe", {"E": 50.0}),                  # Nov PE = 7650 / 50 = 153 > 60
+     ("earnings_yield", {"E": 50.0}),      # EY 0.65 % < 1.5 %
+     ("dividend_yield", {"D": 900.0})],    # DY 11.8 % > 8 %
+)
+def test_range_check_on_derived_month_fails_closed(monkeypatch, net, clock, sid, sep):
+    mtd(monkeypatch, [7600.0, 7700.0])
+    shiller._WORKBOOK_CACHE["monthly"] = _workbook_with(**sep)
+    with pytest.raises(FetchError, match=f"Shiller-derived '{sid}' value .* on 2026-11-.. outside expected range"):
         shiller.fetch(sid, start_date="2010-01-01", end_date=END)
 
 
+def test_range_check_ignores_archive_months_with_bad_shiller_values(monkeypatch, net, clock):
+    """September is <= cutoff: a wild Shiller E for September is never published for pe
+    (archive rows win) - only the carried-forward November is checked."""
+    mtd(monkeypatch, [7600.0])
+    m = _workbook_with(E=50.0)
+    m.loc[pd.Period("2026-10", "M"), ["D", "E"]] = [82.0, 296.0]   # Oct published -> Nov carries 296
+    shiller._WORKBOOK_CACHE["monthly"] = m
+    df = shiller.fetch("pe", start_date="2010-01-01", end_date=END)
+    assert df["value"].iloc[-1] == pytest.approx(7600.0 / 296.0)
+
+
 def test_cape_range_check(monkeypatch, net, clock):
-    mtd(monkeypatch, [99000.0])                 # CAPE ~ 39.37 * 13 -> out of [5, 60]
+    mtd(monkeypatch, [7600.0])
+    m = parsed()
+    m.loc[pd.Period("2026-11", "M"), "CAPE"] = 80.0            # scaled Nov CAPE ~ 79.8 > 60
+    shiller._WORKBOOK_CACHE["monthly"] = m
     with pytest.raises(FetchError, match="'cape'"):
         shiller.fetch("cape", start_date="2010-01-01", end_date=END)
 
@@ -623,3 +696,333 @@ def test_run_carry_forward_keeps_provisional_from(monkeypatch, freeze, la_tz, tm
     out = json.loads(refresh_v2.OUTPUT_PATH.read_text(encoding="utf-8"))
     assert out["series"]["shiller_cape"] == prior["series"]["shiller_cape"]
     assert out["metadata"]["statuses"]["shiller_cape"]["status"] == "error"
+
+
+
+# ===========================================================================
+# QA fixes (docs/qa-shiller.md): M1 own monthly prices, m2 15 % check, M2 negative cache
+# and budget, M3 health notice
+# ===========================================================================
+def _fresh_process(monkeypatch):
+    """A new run: per-process caches cleared (the health JSON on disk is kept)."""
+    monkeypatch.setattr(shiller, "_WORKBOOK_CACHE", {})
+    monkeypatch.setattr(shiller, "_MTD_CACHE", {})
+
+
+ALL = list(shiller._SERIES)
+
+
+def _run_all(end):
+    return {sid: shiller.fetch(sid, start_date="2010-01-01", end_date=end) for sid in ALL}
+
+
+def _at(df, d):
+    return df.set_index("date")["value"][pd.Timestamp(d)]
+
+
+def test_m1_rollover_november_identical_on_11_24_and_12_01(monkeypatch, net):
+    """Same November closes seen on 11-24 and 12-01: November P/E, EY, CAPE (and E) do not jump
+    at the month boundary; only the month-end series' November date moves 11-24 -> 11-30."""
+    yf_stub(monkeypatch, closes({"2026-11": [7600.0, 7700.0]}))
+    a = _run_all("2026-11-24")
+    _fresh_process(monkeypatch)
+    yf_stub(monkeypatch, closes({"2026-11": [7600.0, 7700.0], "2026-12": [7800.0]}))
+    b = _run_all("2026-12-01")
+    for sid in ("pe", "earnings_yield", "cape"):
+        assert _at(a[sid], "2026-11-01") == _at(b[sid], "2026-11-01"), sid
+        assert a[sid].attrs["provisional_from"] == b[sid].attrs["provisional_from"] == "2026-11-01"
+    assert _at(a["pe"], "2026-11-01") == pytest.approx(7650.0 / 295.5184)      # our Nov average, not Shiller P
+    assert _at(a["cape"], "2026-11-01") == pytest.approx(39.374477 * 7650.0 / 7619.38)
+    for sid in ("dividend_yield", "nominal_earnings", "real_earnings"):
+        assert _at(a[sid], "2026-11-24") == pytest.approx(_at(b[sid], "2026-11-30")), sid
+        assert pd.Timestamp("2026-11-30") not in set(a[sid]["date"])
+        assert pd.Timestamp("2026-11-24") not in set(b[sid]["date"])
+    # December appears on 12-01 (synthesized from our price), dated 12-01 / first of month
+    assert b["pe"]["date"].iloc[-1] == pd.Timestamp("2026-12-01")
+    assert b["dividend_yield"]["date"].iloc[-1] == pd.Timestamp("2026-12-01")
+
+
+def test_m1_ended_month_after_cutoff_uses_our_average(monkeypatch):
+    """On 12-10 November has ended; it still uses our average, not Shiller's snapshot P."""
+    yf_stub(monkeypatch, closes({"2026-11": [7600.0, 7700.0], "2026-12": [7900.0]}))
+    eff = shiller._derive(parsed(), date(2026, 12, 10))
+    nov = eff.loc[pd.Period("2026-11", "M")]
+    assert nov["P"] == pytest.approx(7650.0) and bool(nov["prov"])
+    assert eff.loc[pd.Period("2026-10", "M"), "P"] == pytest.approx(7726.692727)   # <= cutoff: Shiller P
+
+
+def test_m1_skipped_shiller_update_no_missing_month(monkeypatch, net):
+    """Today 2027-01-05, workbook still ends 2026-11: December and January are synthesized."""
+    yf_stub(monkeypatch, closes({"2026-11": [7600.0], "2026-12": [7700.0], "2027-01": [7800.0]}))
+    out = _run_all("2027-01-05")
+    pe = out["pe"]
+    assert pe["date"].dt.strftime("%Y-%m-%d").tolist()[-3:] == ["2026-11-01", "2026-12-01", "2027-01-01"]
+    assert pe["value"].iloc[-3:].tolist() == pytest.approx([v / 295.5184 for v in (7600.0, 7700.0, 7800.0)])
+    cape = out["cape"]["value"].iloc[-3:].tolist()
+    nov = 39.374477 * 7600.0 / 7619.38
+    assert cape == pytest.approx([nov, nov * 7700 / 7600, nov * 7800 / 7600])
+    dy = out["dividend_yield"]["date"].dt.strftime("%Y-%m-%d").tolist()[-3:]
+    assert dy == ["2026-11-30", "2026-12-31", "2027-01-05"]
+    for sid in ALL:
+        months = out[sid]["date"].dt.to_period("M")
+        after = [m for m in months if m > pd.Period("2026-10", "M")]
+        assert after == list(pd.period_range("2026-11", "2027-01", freq="M")), sid   # no gap, no duplicate
+
+
+def test_m1_skipped_month_omitted_without_our_price(monkeypatch, net):
+    out = shiller.fetch("pe", start_date="2010-01-01", end_date="2027-01-05")     # yahoo stub raises
+    assert out["date"].iloc[-1] == pd.Timestamp("2026-11-01")
+
+
+# ---------------------------------------------------------------------------
+# m2: our average ignored if more than 15 % from Shiller's P (same / previous month)
+# ---------------------------------------------------------------------------
+P_NOV = 7619.38
+
+
+@pytest.mark.parametrize("factor, used", [(1.149, True), (1.151, False), (0.851, True), (0.849, False)])
+def test_m2_deviation_vs_same_month(monkeypatch, factor, used):
+    ours = P_NOV * factor
+    yf_stub(monkeypatch, closes({"2026-11": [ours]}))
+    nov = shiller._derive(parsed(), TODAY).loc[pd.Period("2026-11", "M")]
+    assert nov["P"] == pytest.approx(ours if used else P_NOV)
+    assert nov["CAPE"] == pytest.approx(39.374477 * (ours / P_NOV if used else 1.0))
+    assert bool(nov["prov"])
+
+
+@pytest.mark.parametrize("factor, present", [(1.14, True), (1.16, False)])
+def test_m2_deviation_vs_previous_month_for_synthesized_month(monkeypatch, factor, present):
+    """December has no Shiller row: compared with November's P (ours, 7600)."""
+    yf_stub(monkeypatch, closes({"2026-11": [7600.0], "2026-12": [7600.0 * factor]}))
+    eff = shiller._derive(parsed(), date(2026, 12, 10))
+    assert (pd.Period("2026-12", "M") in eff.index) is present
+
+
+# ---------------------------------------------------------------------------
+# M2: negative cache, timeouts, shared 90 s budget
+# ---------------------------------------------------------------------------
+def test_m2_negative_cache_one_attempt_each_for_six_series(monkeypatch, net):
+    net.routes[shiller._LANDING_URL] = requests.ConnectionError("landing down")
+    net.routes[shiller._YALE_URL] = requests.ConnectionError("yale down")
+    errors = []
+    for sid in ALL:
+        with pytest.raises(FetchError) as ei:
+            shiller.fetch(sid, end_date=END)
+        errors.append(str(ei.value))
+    assert net.calls == [shiller._LANDING_URL, shiller._YALE_URL]
+    assert len(set(errors)) == 1 and errors[0].startswith("Shiller workbook unavailable - shillerdata.com: ")
+    assert json.loads(shiller._HEALTH_PATH.read_text())["fail_days"] == 1
+
+
+def test_m2_timeouts_passed_to_requests(net):
+    shiller._get_monthly(TODAY)
+    assert net.kwargs[0]["timeout"] == (10.0, 30.0) and net.kwargs[1]["timeout"] == (10.0, 30.0)
+
+
+class Clock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def test_m2_timeouts_clamped_to_remaining_budget(monkeypatch, net):
+    clk = Clock()
+    monkeypatch.setattr(shiller.time, "monotonic", clk)
+    shiller._budget_left()                 # t0 = 1000
+    clk.t = 1065.0                         # 25 s left
+    shiller._get_monthly(TODAY)
+    assert net.kwargs[0]["timeout"] == (10.0, 25.0)
+
+
+def test_m2_budget_exhausted_skips_yale(monkeypatch, net):
+    clk = Clock()
+    monkeypatch.setattr(shiller.time, "monotonic", clk)
+
+    def slow_landing():
+        clk.t += 89.5                      # landing hangs until 0.5 s of budget is left
+        raise requests.Timeout("read timed out")
+
+    net.routes[shiller._LANDING_URL] = slow_landing
+    with pytest.raises(FetchError, match=r"yale: Shiller network time budget \(90 s\) exhausted"):
+        shiller._get_monthly(TODAY)
+    assert net.calls == [shiller._LANDING_URL]           # Yale never requested
+
+
+def test_m2_yahoo_skipped_when_under_5_s_left(monkeypatch):
+    clk = Clock()
+    monkeypatch.setattr(shiller.time, "monotonic", clk)
+    calls = yf_stub(monkeypatch, closes({"2026-11": [7600.0]}))
+    shiller._budget_left()
+    clk.t += 86.0                          # 4 s left
+    assert shiller._gspc_monthly(START) is None
+    assert calls == []
+
+
+def test_m2_yahoo_timeout_clamped(monkeypatch):
+    clk = Clock()
+    monkeypatch.setattr(shiller.time, "monotonic", clk)
+    calls = yf_stub(monkeypatch, closes({"2026-11": [7600.0]}))
+    shiller._budget_left()
+    clk.t += 78.0                          # 12 s left
+    shiller._gspc_monthly(START)
+    assert calls[0][1]["timeout"] == pytest.approx(12.0)
+
+
+# ---------------------------------------------------------------------------
+# M3: health marker and one-time notice
+# ---------------------------------------------------------------------------
+def _health():
+    return json.loads(shiller._HEALTH_PATH.read_text()) if shiller._HEALTH_PATH.exists() else {}
+
+
+def _fail_run(monkeypatch, net, day):
+    _fresh_process(monkeypatch)
+    net.routes[shiller._LANDING_URL] = requests.ConnectionError("down")
+    net.routes[shiller._YALE_URL] = requests.ConnectionError("down")
+    with pytest.raises(FetchError):
+        shiller._get_monthly(day)
+
+
+def _good_run(monkeypatch, net, day=TODAY):
+    _fresh_process(monkeypatch)
+    net.routes[shiller._LANDING_URL] = FakeResp(text=LANDING)
+    shiller._get_monthly(day)
+
+
+def test_m3_no_health_file_no_notice():
+    assert shiller.pending_notice(TODAY) is None
+
+
+def test_m3_failures_counted_once_per_pt_day(monkeypatch, net):
+    _fail_run(monkeypatch, net, date(2026, 11, 24))
+    _fail_run(monkeypatch, net, date(2026, 11, 24))
+    assert _health()["fail_days"] == 1
+    _fail_run(monkeypatch, net, date(2026, 11, 25))
+    assert _health() == {"fail_days": 2, "last_fail_date": "2026-11-25"}
+
+
+def test_m3_failing_notice_once_and_rearms(monkeypatch, net):
+    _fail_run(monkeypatch, net, date(2026, 11, 24))
+    assert shiller.pending_notice(date(2026, 11, 24)) is None
+    _fail_run(monkeypatch, net, date(2026, 11, 25))
+    msg = shiller.pending_notice(date(2026, 11, 25))
+    assert msg == ("\u2139\ufe0f PEC: Shiller valuation data fetch has failed on 2 different days. "
+                   "P/E, CAPE and earnings series are carried forward; see docs/plan.md Amendment C.\n")
+    assert shiller.pending_notice(date(2026, 11, 25)) is None            # de-duplicated
+    _fail_run(monkeypatch, net, date(2026, 11, 26))
+    assert shiller.pending_notice(date(2026, 11, 26)) is None            # same condition
+    _good_run(monkeypatch, net, date(2026, 11, 27))                     # recovery
+    h = _health()
+    assert h["fail_days"] == 0 and h["last_fail_date"] is None and h["last_e"] == "2026-09"
+    assert h["notified"] == {"failing": True}                            # cleared by pending_notice
+    assert shiller.pending_notice(date(2026, 11, 27)) is None
+    assert _health()["notified"] == {}                                   # re-armed
+    _fail_run(monkeypatch, net, date(2026, 11, 30))
+    _fail_run(monkeypatch, net, date(2026, 12, 1))
+    assert "failed on 2 different days" in shiller.pending_notice(date(2026, 12, 1))
+
+
+@pytest.mark.parametrize("last_e, today, expect", [
+    ("2026-06", date(2026, 11, 24), None),                    # 5 months: not yet
+    ("2026-05", date(2026, 11, 24), "6 months old (2026-05)"),
+    ("2026-09", date(2027, 3, 1), "6 months old (2026-09)"),
+])
+def test_m3_stale_earnings_notice(last_e, today, expect):
+    shiller._write_health({"fail_days": 0, "last_fail_date": None, "last_e": last_e, "notified": {}})
+    msg = shiller.pending_notice(today)
+    if expect is None:
+        assert msg is None
+    else:
+        assert f"Shiller's latest published earnings month is {expect}" in msg
+        assert shiller.pending_notice(today) is None                     # sent once
+        assert _health()["notified"] == {"stale": True} and _health()["last_e"] == last_e
+
+
+def test_m3_both_conditions_one_message():
+    shiller._write_health({"fail_days": 3, "last_fail_date": "2026-11-24", "last_e": "2026-03", "notified": {}})
+    msg = shiller.pending_notice(TODAY)
+    assert msg.startswith("\u2139\ufe0f PEC: Shiller valuation data fetch has failed on 3 different days; "
+                          "Shiller's latest published earnings month is 8 months old (2026-03)")
+    assert _health()["notified"] == {"failing": True, "stale": True}
+
+
+def test_m3_success_records_last_e_and_keeps_markers(monkeypatch, net):
+    shiller._write_health({"fail_days": 1, "last_fail_date": "2026-11-23", "notified": {"stale": True}})
+    _good_run(monkeypatch, net)
+    assert _health() == {"fail_days": 0, "last_fail_date": None, "last_e": "2026-09", "notified": {"stale": True}}
+
+
+def test_m3_corrupt_health_file_is_ignored(monkeypatch, net):
+    shiller._HEALTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    shiller._HEALTH_PATH.write_text("{oops")
+    assert shiller.pending_notice(TODAY) is None
+    _fail_run(monkeypatch, net, TODAY)
+    assert _health()["fail_days"] == 1
+
+
+# ---------------------------------------------------------------------------
+# refresh_v2._append_shiller_notice
+# ---------------------------------------------------------------------------
+class _NoticeShiller:
+    def __init__(self, text):
+        self.text, self.calls = text, 0
+
+    def pending_notice(self):
+        self.calls += 1
+        return self.text
+
+    def fetch(self, **kw):
+        df = pd.DataFrame({"date": pd.to_datetime(["2026-11-01"]), "value": [25.9]})
+        df.attrs["provisional_from"] = "2026-11-01"
+        return df
+
+
+def test_append_shiller_notice_after_eps_and_factset_messages(monkeypatch):
+    flag = refresh_v2.EPS_CHANGE_FLAG
+    monkeypatch.setenv("PEC_EPS_MODE", "factset")
+    refresh_v2._write_eps_change_flag({"value": 400.0, "source": "override"},
+                                      {"value": 419.64, "source": "factset", "as_of": "2026-11-20"})
+    refresh_v2._append_factset_notice({"factset_eps": SimpleNamespace(pending_notice=lambda: "factset notice")})
+    refresh_v2._append_shiller_notice({"shiller": _NoticeShiller("shiller notice\n\n")})
+    assert flag.read_text(encoding="utf-8").splitlines() == [
+        "\u2139\ufe0f PEC forward EPS updated: 400.00 \u2192 419.64 (FactSet, as of 2026-11-20)",
+        "factset notice", "shiller notice"]
+
+
+@pytest.mark.parametrize("fetchers", [{}, {"shiller": SimpleNamespace()}, {"shiller": _NoticeShiller(None)}])
+def test_append_shiller_notice_nothing(fetchers):
+    refresh_v2._append_shiller_notice(fetchers)
+    assert not refresh_v2.EPS_CHANGE_FLAG.exists()
+
+
+def test_append_shiller_notice_any_eps_mode(monkeypatch):
+    monkeypatch.setenv("PEC_EPS_MODE", "override")
+    stub = _NoticeShiller("n")
+    refresh_v2._append_shiller_notice({"shiller": stub})
+    assert stub.calls == 1 and refresh_v2.EPS_CHANGE_FLAG.read_text() == "n\n"
+
+
+def test_run_appends_shiller_notice_after_eps_message(monkeypatch, freeze, la_tz, tmp_path):
+    monkeypatch.setenv("PEC_EPS_MODE", "override")
+    freeze(datetime(2026, 11, 24, 13, 20, tzinfo=PT))
+    cfg = {"series": [{"id": "sp500_pe", "source": "shiller", "series_id": "pe", "label": "PE",
+                       "refresh_frequency": "daily_after_close"}],
+           "valuation_inputs": {"forward_eps_ntm": {"fetcher": "spglobal", "series_id": "forward_eps_ntm",
+                                                    "manual_override": {"value": 419.64, "effective_date": "2026-11-20"}}}}
+    p = tmp_path / "series.yaml"
+    p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    monkeypatch.setattr(refresh_v2, "CONFIG_PATH", p)
+    refresh_v2.OUTPUT_PATH.write_text(json.dumps({"metadata": {"statuses": {}}, "series": {},
+        "valuation_inputs": {"forward_eps_ntm": {"value": 400.0, "source": "factset", "as_of": "2026-11-13"}}}))
+    refresh_v2.EPS_CHANGE_FLAG.write_text("stale line from an earlier run\n")
+    stub = _NoticeShiller("\u2139\ufe0f PEC: Shiller notice")
+    sp = SimpleNamespace(fetch=lambda series_id, **kw: pd.DataFrame({"date": pd.to_datetime(["2026-10-31"]), "value": [412.86]}))
+    monkeypatch.setattr(refresh_v2, "_load_fetchers", lambda: {"shiller": stub, "spglobal": sp})
+    refresh_v2.run()
+    assert refresh_v2.EPS_CHANGE_FLAG.read_text(encoding="utf-8").splitlines() == [
+        "\u2139\ufe0f PEC forward EPS updated: 400.00 \u2192 419.64 (manual override, as of 2026-11-20)",
+        "\u2139\ufe0f PEC: Shiller notice"]
+    out = json.loads(refresh_v2.OUTPUT_PATH.read_text())
+    assert out["series"]["sp500_pe"]["provisional_from"] == "2026-11-01"

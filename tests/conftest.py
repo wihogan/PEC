@@ -29,7 +29,7 @@ if str(REPO) not in sys.path:
 # Importing refresh_v2 runs sys.stdout.reconfigure() and logging.basicConfig();
 # both are verified to work under every pytest capture mode (fd, sys, no).
 import refresh_v2  # noqa: E402
-from fetchers import factset_eps, multpl, spglobal, yahoo  # noqa: E402
+from fetchers import factset_eps, multpl, shiller, spglobal, yahoo  # noqa: E402
 
 REAL_CONFIG = REPO / "config" / "series_v2.yaml"
 REAL_SEED = REPO / "config" / "forward_eps_seed.yaml"
@@ -91,6 +91,11 @@ def isolate_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(refresh_v2, "EPS_CHANGE_FLAG", here / "eps_change.txt")
 
     monkeypatch.setattr(multpl, "_CACHE_DIR", cache)
+    # Shiller: health marker file and per-process caches (workbook, ^GSPC, negative cache, budget clock)
+    monkeypatch.setattr(shiller, "_CACHE_DIR", cache)
+    monkeypatch.setattr(shiller, "_HEALTH_PATH", cache / "shiller_health.json")
+    monkeypatch.setattr(shiller, "_WORKBOOK_CACHE", {})
+    monkeypatch.setattr(shiller, "_MTD_CACHE", {})
     monkeypatch.setattr(yahoo, "_CACHE_DIR", cache)
 
     # Never let a unit test see a real key; neutralise workflow-level env
