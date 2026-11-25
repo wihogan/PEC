@@ -139,3 +139,67 @@ None.
    or previous month and fall back to Shiller's.
 6. **m5.** Owner reads shillerdata.com's robots.txt and any terms once and records the result in `docs/plan.md`.
 7. Update the "41 series" texts to 42.
+
+---
+
+## Re-check (2026-11-24, late evening PT)
+
+Ref: `shiller-replace` @ c17864e (fixes e902781, tests c17864e); `main` still 3b8a3e8, merge is a
+fast-forward. Method as before: offline runs against the real workbook copy with the network and
+`^GSPC` stubbed, the unit suite, and a read-only clone of production `state` (846d3e3). Nothing was
+dispatched, pushed or changed.
+
+### Verdict: MERGE
+
+M1–M3 are fixed and reproduced as fixed. One new minor (N1) should follow; it does not hold the merge.
+
+### Majors
+
+| # | Status | Evidence |
+|---|---|---|
+| M1 | RESOLVED | `fetchers/shiller.py:396-451`: every month after the archive cutoff uses our own monthly average of daily `^GSPC` closes (`_gspc_monthly`, lines 358-390, one download per run); months Shiller has not added are synthesized. Real workbook, unchanged across dates: November P/E 25.04 and CAPE 38.24 on 11-30, 12-01 and 12-15 (before the fix: 25.04 → 25.78 and 38.24 → 39.37 on 12-01). On 11-24 with the real 7410.53 average: P/E 25.076, CAPE 38.295, equal to the diag run. Workbook ending November, today 2027-01-05: dates `11-01, 12-01, 01-01`, no hole; 2027-02-10 also continuous. No duplicate dates in any case. |
+| M2 | RESOLVED | `shiller.py:138-148,188-189,208-211`: failure is cached for the process; timeouts are 10 s connect and 30 s read inside a 90 s budget. With both hosts timing out, six fetches made 2 requests (one landing, one Yale), 80 s worst case, against 12 requests and 1,080 s before. The `^GSPC` call adds at most 20 s. This is far inside the 18-minute step limit. Residual: the budget is checked between requests, not inside a slow body transfer. |
+| M3 | RESOLVED | `shiller.py:216-296`, `refresh_v2.py:346-363,1095`, `tools/state.sh:20`. Simulated: no notice on the first failing day; one notice on the second ("has failed on 2 different days"); none on a repeat the same day or on day 3. The marker is saved with state and the message is sent after the save. |
+
+### Minors and nits
+
+| # | Status | Evidence |
+|---|---|---|
+| m1 | RESOLVED | `healthcheck.py:212-220`. Production state plus the new config, with `sp500_earnings_nominal` absent and in `error`: `ok True`, warning "new series not yet populated". Absent with status `ok` still fails rule 2. |
+| m2 | RESOLVED, with a side effect (N1) | `shiller.py:424-431`: an average more than 15 % from Shiller's price is ignored. A 30 % wrong November average falls back to Shiller's 7619.38 (P/E 25.78). |
+| m3 | NOT RESOLVED (deferral acceptable) | An out-of-range value still freezes that series with warnings only; the M3 notice counts workbook failures, not range failures. Low likelihood. No reason is recorded in `docs/plan.md`; I found one only for m5. |
+| m4 | ACCEPTED-DEFERRAL | The 9-month and 3-month limits stand. The new notice for earnings more than 5 months old gives a signal before the limits bite. |
+| m5 | ACCEPTED-DEFERRAL | Recorded as "not yet verified - owner to confirm" (`shiller.py` header, plan Amendment C). Still open for the owner. |
+| m6 | ACCEPTED-DEFERRAL | Real EPS still uses Shiller's estimated CPI for the newest months. Not shown in the UI. |
+| Nits | RESOLVED | Date-index expression simplified; 41 → 42 texts updated. The October double row in the chart is unchanged, by decision. |
+
+### New observations
+
+- **N1 (minor, new).** When Shiller has no row for a month, our average is compared with the
+  previous month's price (`shiller.py:426-431`). A real fall of more than 15 % month on month is
+  then rejected and the month is omitted. Reproduced: December average 20 % below November, no
+  Shiller December row: the series ends at November, status `ok`, a log warning only. Monthly
+  averages fell about 19–20 % in October 2008 and March 2020, so the current point would vanish in
+  exactly those months. Suggested: use about 30 % for the previous-month comparison, or compare
+  with the last `^GSPC` close rather than dropping the month.
+- If the `^GSPC` download fails on a given run, ended months fall back to Shiller's price for that
+  run (November P/E 25.78) and return to our average on the next good run. This is the documented
+  fallback; the value can flip for a day.
+- Rule 2 is now a warning for any missing id whose status is `error` or absent, not only for new
+  ids. After a lost state plus a failed fetch, a slow series could be missing from a deployed page
+  with only a warning. Fast series are still caught by rule 5.
+- No new alert path beyond the one-time notice. A source that fails for two days, recovers and
+  fails again sends one notice per cycle.
+
+### Merge-time behaviour (production `state` 846d3e3)
+
+- Archive rows are identical to production for all four spliced series.
+- The five existing valuation ids are in `error` and the new id is absent, so all six are fetched
+  on the first run at any time of day. If that fetch fails, the run still passes (m1).
+- `shiller_health.json` is not on `state`; `state.sh` treats that as normal. No notice is expected.
+- Chart: CAPE and P/E keep the archive to 10-30 and add one point at 11-01 (about 38.3 and 25.1 at
+  today's prices); no future-dated or duplicate points. `sp500_earnings` is rebuilt (203 rows) and
+  is not drawn in the UI.
+
+### Suite
+1100 passed, 4 deselected, 0 xfailed (Python 3.12, local).
