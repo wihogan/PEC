@@ -1,0 +1,18 @@
+name: probe-shiller
+# Temporary owner-approved validation probe (2026-11-24). Branch-only; delete after use.
+on:
+  push:
+    branches: [probe-shiller]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: pip install -q requests pandas xlrd
+      - run: python tools/probe/probe_shiller.py
