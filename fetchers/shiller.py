@@ -297,6 +297,11 @@ def _series_from(eff: pd.DataFrame, series_id: str) -> pd.DataFrame:
     out = pd.DataFrame({"value": v.astype(float), "prov": eff["prov"]})
     out.index = out.index.to_timestamp(how="end" if month_end else "start").normalize() \
         if not month_end else out.index.to_timestamp(freq="M", how="end").normalize()
+    if month_end:
+        # The in-progress month must not carry a future month-end date: date it today
+        # (as multpl did for its in-month estimate rows).
+        today = pd.Timestamp.now().normalize()
+        out.index = out.index.where(out.index <= today, today)
     out = out.replace([float("inf"), float("-inf")], float("nan")).dropna(subset=["value"])
     out.index.name = "date"
     return out.reset_index()
