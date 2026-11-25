@@ -277,7 +277,7 @@ def _derive(monthly: pd.DataFrame, today: date) -> pd.DataFrame:
     return df
 
 
-def _series_from(eff: pd.DataFrame, series_id: str) -> pd.DataFrame:
+def _series_from(eff: pd.DataFrame, series_id: str, today: Optional[date] = None) -> pd.DataFrame:
     """Compute one series from the effective frame; returns date/value/prov columns."""
     _, month_end = _SERIES[series_id]
     if series_id == "pe":
@@ -300,8 +300,8 @@ def _series_from(eff: pd.DataFrame, series_id: str) -> pd.DataFrame:
     if month_end:
         # The in-progress month must not carry a future month-end date: date it today
         # (as multpl did for its in-month estimate rows).
-        today = pd.Timestamp.now().normalize()
-        out.index = out.index.where(out.index <= today, today)
+        cap = pd.Timestamp(today) if today is not None else pd.Timestamp.now().normalize()  # fetch's PT date (D7)
+        out.index = out.index.where(out.index <= cap, cap)
     out = out.replace([float("inf"), float("-inf")], float("nan")).dropna(subset=["value"])
     out.index.name = "date"
     return out.reset_index()
@@ -348,7 +348,7 @@ def fetch(series_id: str, start_date: str = "2010-01-01", end_date: str = None, 
 
     monthly = _get_monthly(today)
     eff = _derive(monthly, today)
-    derived = _series_from(eff, series_id)
+    derived = _series_from(eff, series_id, today)
 
     archive_key = _SERIES[series_id][0]
     if archive_key is None:

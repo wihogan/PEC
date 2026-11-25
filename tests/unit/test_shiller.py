@@ -425,15 +425,6 @@ def test_month_end_not_clamped_on_last_day(monkeypatch):
     assert shiller._series_from(eff, "dividend_yield")["date"].iloc[-1] == pd.Timestamp("2026-11-30")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "shiller._series_from clamps month-end dates with pd.Timestamp.now() (process clock and "
-        "process zone) instead of the fetch's own `today` (PT, or end_date): with a simulated "
-        "end_date, or a process zone ahead of PT in the evening, the in-progress point is dated "
-        "differently from the derivation's current month (Amendment C: 'dated today')."
-    ),
-)
 def test_today_clamp_uses_fetch_today(monkeypatch, net):
     freeze_now(monkeypatch, "2026-12-15 10:00")
     mtd(monkeypatch, [7600.0])
