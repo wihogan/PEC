@@ -1072,6 +1072,8 @@ def run(filter_ids: Optional[list] = None, force: bool = False) -> None:
                 "last_fetched": existing_statuses.get(sid, {}).get("last_fetched"),
                 "last_attempt": now_ts,
             }
+            if existing_series.get(sid, {}).get("source_used"):   # QA N3: keep matching the carried data
+                statuses[sid]["source_used"] = existing_series[sid]["source_used"]
             failures.append(sid)
 
     attempted = len(series_config) - len(skipped)

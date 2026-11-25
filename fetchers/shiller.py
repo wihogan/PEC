@@ -7,6 +7,7 @@
 #   1. shillerdata.com workbook (primary)
 #   2. multpl.com tables (first fallback; Shiller's downstream republisher). Covers
 #      dividend_yield, pe, earnings_yield and cape; NOT the two earnings series (basis unverified).
+#      Only if its newest row is at most 7 days old.
 #   3. Yale ie_data.xls (last resort; still rejected when its last earnings month is >9 months old)
 #   4. fail closed (FetchError -> refresh_v2 carries the previous series forward)
 # Each source is attempted at most once per run (negative-cached for all series); the three
@@ -19,19 +20,20 @@
 #     on-disk cache: runners are ephemeral and a stale cache would mask an outage; there is
 #     no stale-cache fallback - the archive + carry-forward is the fallback).
 #   * dividend_yield / pe / earnings_yield / cape: archive rows <= 2026-10 unchanged, multpl
-#     rows strictly after 2026-10 appended. Several rows in one month collapse to the latest
-#     dated one; dates use the same conventions as the Shiller path (first-of-month for
-#     pe/ey/cape; month-end for dividend yield and earnings, the in-progress month clamped to
-#     today). Range checks apply to the appended rows.
-#   * (removed 2026-11-25: earnings series do not fail over to multpl) was: real_earnings from multpl, on multpl's
-#     own basis (it is NOT re-based to the latest CPI month the way the Shiller path is, so
-#     recent values can differ from the Shiller-path series by the CPI ratio).
-#   * Provisional: a row flagged with the dagger (estimate) within the last 3 months, or any
-#     row of the current month; df.attrs['provisional_from'] is the first such date.
-#   * Staleness: the newest multpl month must be <= 3 months old (<= 9 for real_earnings,
-#     whose publication lags), else the source is rejected.
+#     rows strictly after 2026-10 appended, ONE row per month. Row rule (all four series alike):
+#     the row dated by the series' own convention (first-of-month for pe/ey/cape, month-end for
+#     dividend yield) wins; the latest-dated row of the month is only the fallback. For the
+#     in-progress month multpl also lists a snapshot row dated today; the convention-dated month
+#     row is the better match for the Shiller path, which uses a month-to-date average price.
+#     Dates use the Shiller-path conventions (in-progress month-end clamped to today). Range
+#     checks apply to the appended rows. earnings series never fail over to multpl.
+#   * Provisional: a row flagged with the dagger (estimate) within the current month plus the
+#     two before it, or any row of the current month; df.attrs['provisional_from'] is the first.
+#   * Freshness (QA M2): multpl is rejected (treated like an unavailable source, NOT cached as
+#     down) unless its newest raw row dated <= today is within 7 calendar days of today (PT).
+#     This subsumes the old "newest month <= 3 months old" rule, which was removed.
 #
-# Source discovery
+# # Source discovery
 # ----------------
 # https://shillerdata.com/ links the workbook with a protocol-relative, versioned href
 # (//img1.wsimg.com/blobby/go/.../downloads/<uuid>/ie_data.xls?ver=...). The link is
@@ -151,8 +153,7 @@ _MULTPL_IDS = {
     "earnings_yield": "sp500_earnings_yield",
     "cape":           "shiller_pe",
 }
-_MULTPL_MAX_AGE_MONTHS = 3             # newest multpl month vs current month (ratio series)
-_MULTPL_EARNINGS_MAX_AGE_MONTHS = 9    # earnings publication lags
+_MULTPL_MAX_AGE_DAYS = 7               # newest raw multpl row vs today (PT); older = source rejected
 _MULTPL_PROV_MONTHS = 2                # dagger rows this recent (or the current month) are provisional
 _FALLBACK_LABEL = {"multpl": "multpl.com", "yale": "Yale ie_data.xls"}
 
@@ -340,14 +341,23 @@ def _multpl_series(series_id: str, today: date) -> pd.DataFrame:
     """
     _, month_end = _SERIES[series_id]
     raw = _get_multpl(_MULTPL_IDS[series_id], today)
-    df = raw.sort_values("date", kind="stable").copy()
+    # Freshness on the RAW rows (before collapsing to months): a month-end dated row of the
+    # in-progress month lies in the future and must not mask a frozen page.
+    seen = raw["date"][raw["date"] <= pd.Timestamp(today)]
+    if seen.empty or (pd.Timestamp(today) - seen.max()).days > _MULTPL_MAX_AGE_DAYS:
+        newest = seen.max().date() if not seen.empty else None
+        raise FetchError(f"multpl data stale: newest row {newest}, today {today} "
+                         f"(max {_MULTPL_MAX_AGE_DAYS} days)")
+    df = raw.copy()
     df["period"] = df["date"].dt.to_period("M")
-    df = df.drop_duplicates("period", keep="last")      # latest-dated row of a month wins
+    # Row rule: the convention-dated month row wins, else the latest-dated row of the month.
+    target = (df["period"].dt.to_timestamp(freq="M", how="end") if month_end
+              else df["period"].dt.to_timestamp(how="start")).dt.normalize()
+    df["_pref"] = df["date"].dt.normalize() == target
+    df = (df.sort_values(["period", "_pref", "date"], kind="stable")
+            .drop_duplicates("period", keep="last"))
     cur = pd.Period(today, "M")
-    limit = _MULTPL_EARNINGS_MAX_AGE_MONTHS if series_id == "real_earnings" else _MULTPL_MAX_AGE_MONTHS
-    last = df["period"].max()
-    if _months_between(last, cur) > limit:
-        raise FetchError(f"multpl data stale: last month {last}, current {cur}")
+    df = df.sort_values("period").reset_index(drop=True)
     age = df["period"].apply(lambda per: _months_between(per, cur))
     df["prov"] = (df["estimate"] & (age <= _MULTPL_PROV_MONTHS)) | (age == 0)
     if month_end:
@@ -361,18 +371,13 @@ def _multpl_series(series_id: str, today: date) -> pd.DataFrame:
 
 def _fetch_multpl(series_id: str, start_dt: pd.Timestamp, today: date) -> pd.DataFrame:
     derived = _multpl_series(series_id, today)
-    archive_key = _SERIES[series_id][0]
-    if archive_key is None:   # real_earnings: multpl's own full series, its own CPI basis
-        _check_range(series_id, derived[derived["date"] >= start_dt], "multpl")
-        out, prov = derived, derived[derived["prov"]]
-    else:
-        arch_df, cutoff = _load_archive(archive_key)
-        cutoff_end = cutoff.to_timestamp(how="end").normalize()
-        appended = derived[derived["period"] > cutoff].copy()
-        _check_range(series_id, appended, "multpl")
-        out = pd.concat([arch_df[arch_df["date"] <= cutoff_end], appended[["date", "value"]]],
-                        ignore_index=True)
-        prov = appended[appended["prov"]]
+    arch_df, cutoff = _load_archive(_SERIES[series_id][0])
+    cutoff_end = cutoff.to_timestamp(how="end").normalize()
+    appended = derived[derived["period"] > cutoff].copy()
+    _check_range(series_id, appended, "multpl")
+    out = pd.concat([arch_df[arch_df["date"] <= cutoff_end], appended[["date", "value"]]],
+                    ignore_index=True)
+    prov = appended[appended["prov"]]
     return _finish(out, prov, start_dt, series_id, "multpl")
 
 
@@ -425,7 +430,10 @@ def _finalize_run(today: date) -> None:
     the end of the run; a no-op when nothing was fetched or the primary served the run, whose
     success _get_primary already recorded).
       * primary failed, something served by a fallback -> source = those fallbacks, streak cleared;
-      * primary failed and nothing at all was served   -> one failing PT day (all sources failed).
+      * primary failed, nothing served and a RATIO series (_MULTPL_IDS) failed on every source
+        -> one failing PT day. Earnings-only runs (the retries while multpl serves the ratios)
+        never count: earnings have no multpl source, so their failure says nothing about
+        all sources being down (QA M1).
     """
     run = _WORKBOOK_CACHE.pop("run", None)
     if not run or not run["primary_failed"]:
@@ -435,7 +443,7 @@ def _finalize_run(today: date) -> None:
         if served:
             raw = _read_health()
             raw.update({"fail_days": 0, "last_fail_date": None, "source": "+".join(served)})
-        elif run["failed"]:
+        elif any(sid in _MULTPL_IDS for sid in run["failed"]):
             _record_failure(today)
             raw = _read_health()
         else:
@@ -506,7 +514,7 @@ def pending_notice(today: Optional[date] = None) -> Optional[str]:
     out = ""
     if msgs:
         out += ("\u2139\ufe0f PEC: " + "; ".join(msgs)
-                + ". P/E, CAPE and earnings series are carried forward; see docs/plan.md Amendment C.\n")
+                + ". P/E, CAPE and earnings series are carried forward; see docs/plan.md Amendment D.\n")
     for line in extra:
         out += line + "\n"
     return out or None
