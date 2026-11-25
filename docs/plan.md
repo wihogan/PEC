@@ -310,3 +310,5 @@ Owner-delegated decision (orchestrator, 2026-11-25). Branch `multpl-fallback`. S
 ### Runbook
 Freshness (`docs/runbook.md` section 1) and alerts (section 2) updated for the new source order and the three messages.
 
+
+**Orchestrator decision (2026-11-25):** both earnings series (`sp500_earnings`, `sp500_earnings_nominal`) do **not** fail over to multpl — multpl's `s-p-500-earnings` basis is unverified against our CPI re-basing (fixture June 2026 298.03 vs Shiller-path values), so a fallback could produce a level jump. Earnings change quarterly; during a Shiller outage they carry forward (then Yale, then fail closed). Only the four ratio series (DY, P/E, EY, CAPE), whose definitions were verified to match, use multpl.

@@ -6,7 +6,7 @@
 # ---------------------------------------------------------------------------------------
 #   1. shillerdata.com workbook (primary)
 #   2. multpl.com tables (first fallback; Shiller's downstream republisher). Covers
-#      dividend_yield, pe, earnings_yield, cape and real_earnings; NOT nominal_earnings.
+#      dividend_yield, pe, earnings_yield and cape; NOT the two earnings series (basis unverified).
 #   3. Yale ie_data.xls (last resort; still rejected when its last earnings month is >9 months old)
 #   4. fail closed (FetchError -> refresh_v2 carries the previous series forward)
 # Each source is attempted at most once per run (negative-cached for all series); the three
@@ -23,7 +23,7 @@
 #     dated one; dates use the same conventions as the Shiller path (first-of-month for
 #     pe/ey/cape; month-end for dividend yield and earnings, the in-progress month clamped to
 #     today). Range checks apply to the appended rows.
-#   * real_earnings: multpl's whole 's-p-500-earnings' series from start_date, on multpl's
+#   * (removed 2026-11-25: earnings series do not fail over to multpl) was: real_earnings from multpl, on multpl's
 #     own basis (it is NOT re-based to the latest CPI month the way the Shiller path is, so
 #     recent values can differ from the Shiller-path series by the CPI ratio).
 #   * Provisional: a row flagged with the dagger (estimate) within the last 3 months, or any
@@ -140,13 +140,16 @@ _HEALTH_PATH = _CACHE_DIR / "shiller_health.json"
 NOTICE_FAIL_DAYS = 2          # Telegram info after this many distinct failing PT days
 NOTICE_STALE_MONTHS = 5       # ... or when Shiller's latest E is more than this many months old
 
-# fetch() series_id -> multpl series id (nominal_earnings has no multpl equivalent)
+# fetch() series_id -> multpl series id. Only the four ratio series fail over to multpl:
+# their definitions were verified to match the Shiller path (Sep/Oct 2026, within tolerance).
+# Both earnings series are deliberately EXCLUDED (orchestrator decision 2026-11-25): multpl's
+# 's-p-500-earnings' basis is unverified against our CPI re-basing, so a fallback could cause a
+# level jump; earnings change only quarterly, so carry-forward during an outage is harmless.
 _MULTPL_IDS = {
     "dividend_yield": "sp500_div_yield",
     "pe":             "sp500_pe",
     "earnings_yield": "sp500_earnings_yield",
     "cape":           "shiller_pe",
-    "real_earnings":  "sp500_earnings",
 }
 _MULTPL_MAX_AGE_MONTHS = 3             # newest multpl month vs current month (ratio series)
 _MULTPL_EARNINGS_MAX_AGE_MONTHS = 9    # earnings publication lags
