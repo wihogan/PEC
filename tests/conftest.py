@@ -35,6 +35,35 @@ REAL_CONFIG = REPO / "config" / "series_v2.yaml"
 REAL_SEED = REPO / "config" / "forward_eps_seed.yaml"
 TEMPLATE = REPO / "PECtemplate.html"
 
+# Series added to the config after the zip baseline (tests/fixtures/baseline_data_v2.json, frozen
+# laptop output) was captured, mapped to the baseline series whose data stands in for them.
+# Amendment C: sp500_earnings_nominal (Shiller E as published) - same shape as sp500_earnings.
+BASELINE_STAND_INS = {"sp500_earnings_nominal": "sp500_earnings"}
+
+
+def baseline_for_config(config: dict) -> dict:
+    """A deep COPY of the frozen baseline whose series ids match `config` (plus fwd_pe_history).
+
+    Ids the config gained after the baseline was captured are filled from BASELINE_STAND_INS
+    (data and status copied); any other mismatch fails loudly so a config change is noticed.
+    The fixture file itself is never modified.
+    """
+    import copy
+    import json as _json
+
+    base = _json.loads((FIXTURES / "baseline_data_v2.json").read_text(encoding="utf-8"))
+    want = {e["id"] for e in config["series"]}
+    for sid in sorted(want - set(base["series"])):
+        src = BASELINE_STAND_INS.get(sid)
+        assert src, f"config id {sid!r} missing from baseline and has no stand-in in conftest"
+        base["series"][sid] = copy.deepcopy(base["series"][src])
+        st = base["metadata"]["statuses"].get(src)
+        if st is not None:
+            base["metadata"]["statuses"][sid] = copy.deepcopy(st)
+    extra = set(base["series"]) - want - {"fwd_pe_history"}
+    assert not extra, f"baseline ids not in config: {sorted(extra)}"
+    return base
+
 
 @pytest.fixture(autouse=True)
 def isolate_paths(tmp_path, monkeypatch):
