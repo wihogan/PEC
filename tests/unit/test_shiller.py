@@ -20,7 +20,7 @@ import yfinance
 
 import refresh_v2
 from conftest import FIXTURES, REPO
-from fetchers import shiller
+from fetchers import multpl, shiller
 from fetchers.base import FetchError
 
 SHILLER_DIR = FIXTURES / "shiller"
@@ -36,6 +36,7 @@ LANDING = (
     'U.S. Stock Markets 1871-Present and CAPE Ratio</a></body></html>'
 )
 TODAY = date(2026, 11, 24)
+MULTPL_URL = {mp: multpl._BASE_URL.format(slug=multpl._SERIES[mp][0]) for mp in multpl._SERIES}
 END = TODAY.isoformat()
 
 
@@ -639,14 +640,16 @@ def test_workbook_fetched_once_for_all_series(monkeypatch, net, clock):
 def test_fetch_standard_copies_provisional_from_for_shiller_only():
     df = pd.DataFrame({"date": pd.to_datetime(["2026-10-01", "2026-11-01"]), "value": [26.0, 25.9]})
     df.attrs["provisional_from"] = "2026-11-01"
+    df.attrs["source_used"] = "multpl"
     stub = SimpleNamespace(fetch=lambda **kw: df)
     out = refresh_v2._fetch_standard({"source": "shiller", "series_id": "pe"}, {"shiller": stub})
-    assert out == {"dates": ["2026-10-01", "2026-11-01"], "values": [26.0, 25.9], "provisional_from": "2026-11-01"}
+    assert out == {"dates": ["2026-10-01", "2026-11-01"], "values": [26.0, 25.9],
+                   "provisional_from": "2026-11-01", "source_used": "multpl"}
     out = refresh_v2._fetch_standard({"source": "yahoo", "series_id": "^GSPC"}, {"yahoo": stub})
-    assert "provisional_from" not in out
+    assert "provisional_from" not in out and "source_used" not in out
     df.attrs.clear()
     out = refresh_v2._fetch_standard({"source": "shiller", "series_id": "pe"}, {"shiller": stub})
-    assert out["provisional_from"] is None
+    assert out["provisional_from"] is None and out["source_used"] is None
 
 
 def test_run_end_to_end_writes_provisional_from(monkeypatch, net, clock, freeze, la_tz, tmp_path):
@@ -804,13 +807,19 @@ def test_m2_deviation_vs_previous_month_for_synthesized_month(monkeypatch, facto
 def test_m2_negative_cache_one_attempt_each_for_six_series(monkeypatch, net):
     net.routes[shiller._LANDING_URL] = requests.ConnectionError("landing down")
     net.routes[shiller._YALE_URL] = requests.ConnectionError("yale down")
-    errors = []
+    errors = {}
     for sid in ALL:
         with pytest.raises(FetchError) as ei:
             shiller.fetch(sid, end_date=END)
-        errors.append(str(ei.value))
-    assert net.calls == [shiller._LANDING_URL, shiller._YALE_URL]
-    assert len(set(errors)) == 1 and errors[0].startswith("Shiller workbook unavailable - shillerdata.com: ")
+        errors[sid] = str(ei.value)
+    # one landing request, ONE multpl request (refused -> multpl down for the run), one Yale request
+    assert net.calls == [shiller._LANDING_URL, MULTPL_URL["sp500_div_yield"], shiller._YALE_URL]
+    for sid, msg in errors.items():
+        assert msg.startswith(f"Valuation sources unavailable for '{sid}' - shillerdata.com: ")
+        assert ("multpl:" in msg) is (sid in shiller._MULTPL_IDS)
+        assert "yale:" in msg
+    assert not shiller._HEALTH_PATH.exists()               # outcome recorded by pending_notice()
+    shiller.pending_notice(TODAY)
     assert json.loads(shiller._HEALTH_PATH.read_text())["fail_days"] == 1
 
 
@@ -877,18 +886,28 @@ def _health():
     return json.loads(shiller._HEALTH_PATH.read_text()) if shiller._HEALTH_PATH.exists() else {}
 
 
-def _fail_run(monkeypatch, net, day):
+def _fail_run(monkeypatch, net, day, series=("pe", "cape", "nominal_earnings")):
+    """One run in which every source fails for every series; returns the end-of-run notice."""
     _fresh_process(monkeypatch)
     net.routes[shiller._LANDING_URL] = requests.ConnectionError("down")
     net.routes[shiller._YALE_URL] = requests.ConnectionError("down")
-    with pytest.raises(FetchError):
-        shiller._get_monthly(day)
+    for sid in series:
+        with pytest.raises(FetchError):
+            shiller.fetch(sid, start_date="2010-01-01", end_date=day.isoformat())
+    return shiller.pending_notice(day)
 
 
 def _good_run(monkeypatch, net, day=TODAY):
     _fresh_process(monkeypatch)
     net.routes[shiller._LANDING_URL] = FakeResp(text=LANDING)
-    shiller._get_monthly(day)
+    for sid in ("pe", "nominal_earnings"):
+        shiller.fetch(sid, start_date="2010-01-01", end_date=day.isoformat())
+    return shiller.pending_notice(day)
+
+
+FAILING_TEXT = ("\u2139\ufe0f PEC: Valuation data fetch (shillerdata.com, multpl.com and Yale) has failed "
+                "on {n} different days. P/E, CAPE and earnings series are carried forward; "
+                "see docs/plan.md Amendment D.\n")
 
 
 def test_m3_no_health_file_no_notice():
@@ -899,29 +918,23 @@ def test_m3_failures_counted_once_per_pt_day(monkeypatch, net):
     _fail_run(monkeypatch, net, date(2026, 11, 24))
     _fail_run(monkeypatch, net, date(2026, 11, 24))
     assert _health()["fail_days"] == 1
-    _fail_run(monkeypatch, net, date(2026, 11, 25))
-    assert _health() == {"fail_days": 2, "last_fail_date": "2026-11-25"}
+    assert _fail_run(monkeypatch, net, date(2026, 11, 25)) == FAILING_TEXT.format(n=2)
+    assert _health() == {"fail_days": 2, "last_fail_date": "2026-11-25", "primary_down_since": "2026-11-24",
+                         "notified": {"failing": True}}
 
 
 def test_m3_failing_notice_once_and_rearms(monkeypatch, net):
-    _fail_run(monkeypatch, net, date(2026, 11, 24))
-    assert shiller.pending_notice(date(2026, 11, 24)) is None
-    _fail_run(monkeypatch, net, date(2026, 11, 25))
-    msg = shiller.pending_notice(date(2026, 11, 25))
-    assert msg == ("\u2139\ufe0f PEC: Shiller valuation data fetch has failed on 2 different days. "
-                   "P/E, CAPE and earnings series are carried forward; see docs/plan.md Amendment C.\n")
+    assert _fail_run(monkeypatch, net, date(2026, 11, 24)) is None
+    assert _fail_run(monkeypatch, net, date(2026, 11, 25)) == FAILING_TEXT.format(n=2)
     assert shiller.pending_notice(date(2026, 11, 25)) is None            # de-duplicated
-    _fail_run(monkeypatch, net, date(2026, 11, 26))
-    assert shiller.pending_notice(date(2026, 11, 26)) is None            # same condition
-    _good_run(monkeypatch, net, date(2026, 11, 27))                     # recovery
+    assert _fail_run(monkeypatch, net, date(2026, 11, 26)) is None       # same condition
+    assert _good_run(monkeypatch, net, date(2026, 11, 27)) is None       # recovery (no fallback was announced)
     h = _health()
     assert h["fail_days"] == 0 and h["last_fail_date"] is None and h["last_e"] == "2026-09"
-    assert h["notified"] == {"failing": True}                            # cleared by pending_notice
-    assert shiller.pending_notice(date(2026, 11, 27)) is None
-    assert _health()["notified"] == {}                                   # re-armed
+    assert h["source"] == "shiller" and h["primary_down_since"] is None
+    assert h["notified"] == {}                                           # re-armed by that pending_notice
     _fail_run(monkeypatch, net, date(2026, 11, 30))
-    _fail_run(monkeypatch, net, date(2026, 12, 1))
-    assert "failed on 2 different days" in shiller.pending_notice(date(2026, 12, 1))
+    assert "failed on 2 different days" in _fail_run(monkeypatch, net, date(2026, 12, 1))
 
 
 @pytest.mark.parametrize("last_e, today, expect", [
@@ -943,15 +956,18 @@ def test_m3_stale_earnings_notice(last_e, today, expect):
 def test_m3_both_conditions_one_message():
     shiller._write_health({"fail_days": 3, "last_fail_date": "2026-11-24", "last_e": "2026-03", "notified": {}})
     msg = shiller.pending_notice(TODAY)
-    assert msg.startswith("\u2139\ufe0f PEC: Shiller valuation data fetch has failed on 3 different days; "
+    assert msg.startswith("\u2139\ufe0f PEC: Valuation data fetch (shillerdata.com, multpl.com and Yale) "
+                          "has failed on 3 different days; "
                           "Shiller's latest published earnings month is 8 months old (2026-03)")
     assert _health()["notified"] == {"failing": True, "stale": True}
 
 
 def test_m3_success_records_last_e_and_keeps_markers(monkeypatch, net):
     shiller._write_health({"fail_days": 1, "last_fail_date": "2026-11-23", "notified": {"stale": True}})
-    _good_run(monkeypatch, net)
-    assert _health() == {"fail_days": 0, "last_fail_date": None, "last_e": "2026-09", "notified": {"stale": True}}
+    _fresh_process(monkeypatch)
+    shiller._get_primary(TODAY)
+    assert _health() == {"fail_days": 0, "last_fail_date": None, "last_e": "2026-09", "source": "shiller",
+                         "primary_down_since": None, "notified": {"stale": True}}
 
 
 def test_m3_corrupt_health_file_is_ignored(monkeypatch, net):

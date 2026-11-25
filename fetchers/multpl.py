@@ -1,5 +1,6 @@
-# NOTE (2026-11-24): UNUSED. multpl.com was replaced by fetchers/shiller.py (docs/plan.md
-# Amendment C). Kept in the repo for reference and its tests; not registered in series_v2.yaml.
+# NOTE (2026-11-25): multpl.com is not a registered source in series_v2.yaml (replaced by
+# fetchers/shiller.py, docs/plan.md Amendment C). It is used as the FIRST FALLBACK of
+# fetchers/shiller.py (Amendment D) through fetch_live() below, which reuses _parse_html().
 #
 # multpl.py — Fetches S&P 500 valuation metrics from multpl.com monthly tables.
 #
@@ -122,6 +123,7 @@ def _parse_html(
     is_percent: bool,
     start_dt:   date,
     end_dt:     date,
+    with_estimate: bool = False,
 ) -> pd.DataFrame:
     soup  = BeautifulSoup(html, "lxml")
     table = soup.find("table", {"id": "datatable"})
@@ -147,7 +149,12 @@ def _parse_html(
             continue
 
         if start_dt <= row_date <= end_dt:
-            rows.append({"date": pd.Timestamp(row_date), "value": value})
+            row = {"date": pd.Timestamp(row_date), "value": value}
+            if with_estimate:
+                # multpl marks in-month estimates with a dagger (<abbr title="Estimate">).
+                row["estimate"] = ("\u2020" in tds[1].get_text()
+                                   or tds[1].find("abbr", {"title": "Estimate"}) is not None)
+            rows.append(row)
 
     if not rows:
         raise FetchError(
@@ -226,3 +233,37 @@ def fetch(
         df["date"].iloc[0].date(), df["date"].iloc[-1].date(),
     )
     return df
+
+
+def fetch_live(
+    series_id:  str,
+    start_date: str           = "1871-01-01",
+    end_date:   Optional[str] = None,
+    timeout:    tuple         = (10.0, 30.0),
+) -> pd.DataFrame:
+    """
+    Fetch a multpl.com monthly table straight from the network, for the Shiller fallback
+    path (fetchers/shiller.py, Amendment D). Differences from fetch():
+
+      * the on-disk HTML cache is neither read nor written (runners are ephemeral and a
+        stale cache would mask an outage; there is deliberately no stale-cache fallback);
+      * the caller supplies the (connect, read) timeouts;
+      * the result has a third boolean column 'estimate' (True where multpl marks the row
+        with the dagger).
+
+    Rows are returned as published (several rows may fall in one month; dates are multpl's).
+    Raises FetchError on unsupported id, network failure (incl. connection refused) or parse
+    failure.
+    """
+    if series_id not in _SERIES:
+        raise FetchError(f"[multpl] Unsupported series_id '{series_id}'. Supported: {sorted(_SERIES)}")
+    slug, is_percent = _SERIES[series_id]
+    url = _BASE_URL.format(slug=slug)
+    try:
+        resp = requests.get(url, headers=_HEADERS, timeout=timeout)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise FetchError(f"[multpl] Failed to fetch {url}: {exc}") from exc
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else date.today()
+    return _parse_html(resp.text, is_percent, start_dt, end_dt, with_estimate=True)

@@ -232,6 +232,8 @@ def run_checks(data_path: Path, html_path: Path, config_path: Path, now: datetim
                 "age_days": age,
                 "status": (statuses.get(sid) or {}).get("status", "unknown"),
             }
+            if (statuses.get(sid) or {}).get("source_used"):
+                series_report[sid]["source_used"] = statuses[sid]["source_used"]
 
         # Rule 4: attempted this run
         def attempted(sid: str) -> bool:
