@@ -209,8 +209,15 @@ def run_checks(data_path: Path, html_path: Path, config_path: Path, now: datetim
         want = set(cfg_series)
         missing = sorted(want - got)
         extra = sorted(got - want)
-        if missing:
-            failures.append(f"rule 2: missing series ids: {', '.join(missing)}")
+        # A newly configured id that never fetched (status error or absent) is only a warning:
+        # the previous state cannot contain it. Missing with status ok would be a bug: fail.
+        new_unpopulated = [s for s in missing
+                           if (statuses.get(s) or {}).get("status", "error") == "error"]
+        hard_missing = [s for s in missing if s not in new_unpopulated]
+        if new_unpopulated:
+            warnings.append(f"new series not yet populated: {', '.join(new_unpopulated)}")
+        if hard_missing:
+            failures.append(f"rule 2: missing series ids: {', '.join(hard_missing)}")
         if extra:
             failures.append(f"rule 2: unknown series ids: {', '.join(extra)}")
 

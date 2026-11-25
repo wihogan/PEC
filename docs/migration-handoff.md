@@ -156,7 +156,7 @@ Open questions:
 
 - Unattended weekday refresh for five consecutive business days with no laptop involved.
 - Manual refresh works from a browser.
-- 41 series present; data parity with the laptop baseline confirmed.
+- 41 series present (42 after Amendment C); data parity with the laptop baseline confirmed.
 - All dashboard features in the UAT list work.
 - A failed run does not replace the live page and notifies Hogan.
 - No secret in the repo, the logs or the zip.

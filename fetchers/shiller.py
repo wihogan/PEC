@@ -30,14 +30,38 @@
 #
 # Provisional handling (owner decisions)
 # --------------------------------------
-#   * Current Pacific month: price = month-to-date average of daily ^GSPC closes (Yahoo).
-#     If that download fails, Shiller's own P for the month is used (fail closed); if
-#     Shiller has no row for the month either, the month is omitted.
+#   * Every month AFTER the archive cutoff (2026-10), ended or current: price = our own
+#     monthly average of daily ^GSPC closes (one cached Yahoo download per run, starting at
+#     the first day of the month after the cutoff). Shiller's last price row is a snapshot,
+#     not a monthly average, so his P is only a fallback when ours is unavailable for that
+#     month (or is >15% away from his). If Shiller has no row for a month and ours is
+#     unavailable, the month is omitted.
+#   * A month Shiller has not published a row for (skipped update) is synthesized with the
+#     same rule as the current month (see CAPE below) and is provisional.
 #   * Months where Shiller's D/E are blank (latest 1-3 months): the last published D and E
 #     are carried forward.
-#   * CAPE: Shiller's value for months he publishes; for the current month with our own
-#     price: CAPE_shiller_m * (P_ours / P_shiller_m); with no Shiller row yet:
+#   * CAPE: Shiller's value for months he publishes (all months up to the cutoff, spliced
+#     from the archive); for months after the cutoff with our own price:
+#     CAPE_shiller_m * (P_ours / P_shiller_m); with no Shiller row:
 #     (P_ours / CPI_est) / (P_prev / CPI_prev / CAPE_prev), CPI_est = latest Shiller CPI.
+#     Ended months stay provisional while Shiller's D/E for them are carried forward, so
+#     their values change only when Shiller publishes new D/E/CPI/CAPE (no month-end jump).
+#
+# Network limits (docs/qa-shiller.md M2)
+# --------------------------------------
+# A failed workbook load is remembered for the process (at most ONE landing attempt and ONE
+# Yale attempt per run for all six series); connect timeout 10 s, read timeout 30 s; all
+# Shiller network work (landing, workbook, Yale, ^GSPC download) shares a 90 s budget.
+# The ^GSPC download is cached including failure.
+#
+# Health marker (docs/qa-shiller.md M3)
+# -------------------------------------
+# .cache/shiller_health.json (persisted on the state branch) counts failing PT days and
+# remembers the last good workbook's last earnings month; pending_notice() returns a
+# one-time message after 2 failing PT days or when that month is >5 months old.
+#
+# Licensing: shillerdata.com terms/robots not yet verified (owner to confirm); the workbook is
+# downloaded once per trading day with an identifying User-Agent.
 #   * The first provisional point is returned in df.attrs["provisional_from"] (ISO date
 #     of that series' own date convention, or None); refresh_v2 stores it as
 #     series["provisional_from"].
@@ -50,6 +74,7 @@ import html
 import json
 import logging
 import re
+import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
@@ -68,6 +93,17 @@ _ARCHIVE_PATH = Path(__file__).parent.parent / "config" / "multpl_archive.json"
 _OLE2_MAGIC = b"\xD0\xCF\x11\xE0"
 _MAX_EARNINGS_AGE_MONTHS = 9
 _PT = ZoneInfo("America/Los_Angeles")
+_DEFAULT_CUTOFF = "2026-10"
+_NET_CONNECT_S = 10.0
+_NET_READ_S = 30.0
+_NET_BUDGET_S = 90.0
+_YF_TIMEOUT_S = 20.0
+_MAX_PRICE_DEVIATION = 0.15   # our monthly average vs Shiller's P for the same/previous month
+
+_CACHE_DIR = Path(__file__).parent.parent / ".cache"
+_HEALTH_PATH = _CACHE_DIR / "shiller_health.json"
+NOTICE_FAIL_DAYS = 2          # Telegram info after this many distinct failing PT days
+NOTICE_STALE_MONTHS = 5       # ... or when Shiller's latest E is more than this many months old
 
 _HEADERS = {"User-Agent": "PEC-dashboard/1.0 (personal macro dashboard; +https://github.com/wihogan/PEC)"}
 
@@ -92,16 +128,29 @@ _RANGES = {
 }
 
 # In-memory, per-process caches (the runner is ephemeral).
-_WORKBOOK_CACHE: dict = {}
-_MTD_CACHE: dict = {}
+_WORKBOOK_CACHE: dict = {}   # "monthly", "error", "t0" (network budget start)
+_MTD_CACHE: dict = {}        # ^GSPC monthly averages, keyed by download start date; failure cached as None
 
 
 # ---------------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------------
+def _budget_left() -> float:
+    t0 = _WORKBOOK_CACHE.setdefault("t0", time.monotonic())
+    return max(0.0, _NET_BUDGET_S - (time.monotonic() - t0))
+
+
+def _timeout() -> tuple:
+    """(connect, read) timeouts clamped to what is left of the 90 s per-run budget."""
+    left = _budget_left()
+    if left < 1.0:
+        raise FetchError(f"Shiller network time budget ({_NET_BUDGET_S:.0f} s) exhausted")
+    return (min(_NET_CONNECT_S, left), min(_NET_READ_S, left))
+
+
 def _discover_url() -> str:
     try:
-        resp = requests.get(_LANDING_URL, headers=_HEADERS, timeout=60)
+        resp = requests.get(_LANDING_URL, headers=_HEADERS, timeout=_timeout())
         resp.raise_for_status()
     except requests.RequestException as exc:
         raise FetchError(f"Failed to load {_LANDING_URL}: {exc}") from exc
@@ -118,7 +167,7 @@ def _discover_url() -> str:
 
 def _download(url: str) -> bytes:
     try:
-        resp = requests.get(url, headers=_HEADERS, timeout=120)
+        resp = requests.get(url, headers=_HEADERS, timeout=_timeout())
         resp.raise_for_status()
     except requests.RequestException as exc:
         raise FetchError(f"Failed to download {url}: {exc}") from exc
@@ -136,6 +185,8 @@ def _get_monthly(today: date) -> pd.DataFrame:
     """Monthly frame (index Period[M]; columns P, D, E, CPI, CAPE; NaN where blank), cached."""
     if "monthly" in _WORKBOOK_CACHE:
         return _WORKBOOK_CACHE["monthly"]
+    if "error" in _WORKBOOK_CACHE:
+        raise _WORKBOOK_CACHE["error"]   # negative cache: one landing + one Yale attempt per run
     errors = []
     for label, getter in (("shillerdata.com", lambda: _download(_discover_url())),
                           ("yale", lambda: _download(_YALE_URL))):
@@ -149,11 +200,100 @@ def _get_monthly(today: date) -> pd.DataFrame:
             log.info("[shiller] using %s workbook (%d bytes); last P %s, last E %s",
                      label, len(content), monthly["P"].dropna().index.max(), last_e)
             _WORKBOOK_CACHE["monthly"] = monthly
+            _record_success(last_e)
             return monthly
         except FetchError as exc:
             errors.append(f"{label}: {exc}")
             log.warning("[shiller] %s failed: %s", label, exc)
-    raise FetchError("Shiller workbook unavailable - " + " | ".join(errors))
+    err = FetchError("Shiller workbook unavailable - " + " | ".join(errors))
+    _WORKBOOK_CACHE["error"] = err
+    _record_failure(today)
+    raise err
+
+
+# ---------------------------------------------------------------------------
+# Health marker and one-time notice (same pattern as factset_eps.pending_notice)
+# ---------------------------------------------------------------------------
+def _read_health() -> dict:
+    try:
+        with open(_HEALTH_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_health(payload: dict) -> None:
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_HEALTH_PATH, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+def _record_failure(today: date) -> None:
+    """Count one failing PT day (several failures on one day count once)."""
+    try:
+        raw = _read_health()
+        if raw.get("last_fail_date") != today.isoformat():
+            raw["fail_days"] = int(raw.get("fail_days") or 0) + 1
+            raw["last_fail_date"] = today.isoformat()
+            _write_health(raw)
+    except Exception as exc:  # pragma: no cover
+        log.warning("[shiller] could not record failure marker: %s", exc)
+
+
+def _record_success(last_e: pd.Period) -> None:
+    """A good workbook clears the failure streak; notice markers are kept (cleared by pending_notice)."""
+    try:
+        raw = _read_health()
+        new = {"fail_days": 0, "last_fail_date": None, "last_e": str(last_e),
+               "notified": raw.get("notified") if isinstance(raw.get("notified"), dict) else {}}
+        if new != {k: raw.get(k) for k in new}:
+            _write_health(new)
+    except Exception as exc:  # pragma: no cover
+        log.warning("[shiller] could not record success marker: %s", exc)
+
+
+def pending_notice(today: Optional[date] = None) -> Optional[str]:
+    """
+    One-time informational message when the Shiller fetch has failed on 2 distinct PT days
+    since the last success, or Shiller's latest published earnings month is more than
+    5 months old; else None. Each condition is reported once (marker in the health JSON)
+    and re-arms when the condition clears.
+    """
+    today = today or datetime.now(_PT).date()
+    raw = _read_health()
+    if not raw:
+        return None
+    notified = dict(raw["notified"]) if isinstance(raw.get("notified"), dict) else {}
+    fail_days = int(raw.get("fail_days") or 0)
+    failing = fail_days >= NOTICE_FAIL_DAYS
+    stale_months = None
+    try:
+        stale_months = _months_between(pd.Period(str(raw.get("last_e")), "M"), pd.Period(today, "M"))
+    except Exception:
+        pass
+    stale = stale_months is not None and stale_months > NOTICE_STALE_MONTHS
+    msgs = []
+    for name, active, text in (
+        ("failing", failing, f"Shiller valuation data fetch has failed on {fail_days} different days"),
+        ("stale", stale, f"Shiller's latest published earnings month is {stale_months} months old "
+                         f"({raw.get('last_e')}); upstream may have stopped updating"),
+    ):
+        if active and not notified.get(name):
+            msgs.append(text)
+            notified[name] = True
+        elif not active:
+            notified.pop(name, None)
+    if notified != (raw.get("notified") if isinstance(raw.get("notified"), dict) else {}):
+        raw["notified"] = notified
+        try:
+            _write_health(raw)
+        except Exception as exc:  # pragma: no cover
+            log.warning("[shiller] could not write notice marker: %s", exc)
+    if not msgs:
+        return None
+    return ("\u2139\ufe0f PEC: " + "; ".join(msgs)
+            + ". P/E, CAPE and earnings series are carried forward; see docs/plan.md Amendment C.\n")
 
 
 # ---------------------------------------------------------------------------
@@ -205,31 +345,49 @@ def _parse_workbook(content: bytes) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Month-to-date S&P 500 price
+# Our own monthly S&P 500 price (average of daily ^GSPC closes)
 # ---------------------------------------------------------------------------
-def _mtd_price(today: date) -> Optional[float]:
-    """Average of daily ^GSPC closes from the first of today's month; None on any failure."""
-    key = today.strftime("%Y-%m")
+def _archive_cutoff() -> pd.Period:
+    try:
+        with open(_ARCHIVE_PATH, "r", encoding="utf-8") as fh:
+            return pd.Period(json.load(fh)["cutoff_month"], "M")
+    except Exception:
+        return pd.Period(_DEFAULT_CUTOFF, "M")
+
+
+def _gspc_monthly(start: date) -> Optional[dict]:
+    """
+    {Period[M]: average of daily ^GSPC closes} for every month from `start`'s month, from ONE
+    Yahoo download per run (cached, failure included as None). None on any failure.
+    """
+    key = start.isoformat()
     if key in _MTD_CACHE:
         return _MTD_CACHE[key]
-    val = None
+    out = None
     try:
+        if _budget_left() < 5.0:
+            raise TimeoutError("Shiller network time budget exhausted")
         import yfinance as yf  # noqa: PLC0415
-        raw = yf.download("^GSPC", start=today.replace(day=1).isoformat(), auto_adjust=True,
-                          progress=False, multi_level_index=False)
+        raw = yf.download("^GSPC", start=key, auto_adjust=True, progress=False,
+                          multi_level_index=False, timeout=min(_YF_TIMEOUT_S, _budget_left()))
         if raw is not None and not raw.empty:
             close = pd.to_numeric(raw["Close"], errors="coerce").dropna()
-            close = close[close.index.tz_localize(None) >= pd.Timestamp(today.replace(day=1))] \
-                if getattr(close.index, "tz", None) is None else close
+            idx = pd.DatetimeIndex(close.index)
+            if idx.tz is not None:
+                idx = idx.tz_localize(None)
+            close.index = idx
+            close = close[close.index >= pd.Timestamp(start)]
             if len(close):
-                val = float(close.mean())
-                log.info("[shiller] MTD ^GSPC average %.2f over %d closes", val, len(close))
+                grouped = close.groupby(close.index.to_period("M"))
+                avgs = grouped.mean()
+                counts = grouped.size()
+                out = {per: float(v) for per, v in avgs.items() if 100 < v < 100000}
+                log.info("[shiller] ^GSPC monthly averages: %s",
+                         ", ".join(f"{per} {avgs[per]:.2f} ({counts[per]} closes)" for per in avgs.index))
     except Exception as exc:  # fail closed to Shiller's P
-        log.warning("[shiller] MTD ^GSPC download failed (%s); falling back to Shiller P", exc)
-    if val is None or not (100 < val < 100000):
-        val = None
-    _MTD_CACHE[key] = val
-    return val
+        log.warning("[shiller] ^GSPC download failed (%s); falling back to Shiller P", exc)
+    _MTD_CACHE[key] = out or None
+    return _MTD_CACHE[key]
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +395,10 @@ def _mtd_price(today: date) -> Optional[float]:
 # ---------------------------------------------------------------------------
 def _derive(monthly: pd.DataFrame, today: date) -> pd.DataFrame:
     """
-    Effective monthly frame with columns P, D, E, CPI, CAPE, prov (bool), covering
-    Shiller's months with a price plus the current month if not yet in the workbook.
+    Effective monthly frame with columns P, D, E, CPI, CAPE, prov (bool), covering Shiller's
+    months with a price plus any later month up to the current one for which we have our own
+    price. Months after the archive cutoff use our monthly average of daily ^GSPC closes
+    (Shiller's P only as a fallback); see the module header.
     """
     df = monthly[monthly["P"].notna()].copy()
     cur = pd.Period(today, "M")
@@ -253,26 +413,40 @@ def _derive(monthly: pd.DataFrame, today: date) -> pd.DataFrame:
     df["E"] = df["E"].ffill()
     df["CPI"] = df["CPI"].ffill()
 
-    p_ours = _mtd_price(today)
-    if p_ours is not None:
-        if cur in df.index:
-            row = df.loc[cur]
-            p_sh, cape_sh = row["P"], row["CAPE"]
-            if pd.notna(cape_sh) and p_sh:
-                df.loc[cur, "CAPE"] = cape_sh * (p_ours / p_sh)
-            df.loc[cur, "P"] = p_ours
-            df.loc[cur, "prov"] = True
-        else:
-            prev = df.iloc[-1]
+    cutoff = _archive_cutoff()
+    first = cutoff + 1
+    ours = _gspc_monthly(first.to_timestamp().date()) or {}
+    sh_last = df.index.max()
+
+    for m in pd.period_range(first, cur, freq="M"):
+        p_ours = ours.get(m)
+        if p_ours is not None:
+            ref_m = m if m in df.index else m - 1
+            ref = df["P"].get(ref_m)
+            if ref is not None and pd.notna(ref) and abs(p_ours / ref - 1) > _MAX_PRICE_DEVIATION:
+                log.warning("[shiller] ^GSPC average %.2f for %s is >%d%% away from Shiller P %.2f (%s); ignoring it",
+                            p_ours, m, round(_MAX_PRICE_DEVIATION * 100), ref, ref_m)
+                p_ours = None
+        if m in df.index:
+            if p_ours is not None:
+                p_sh, cape_sh = df.loc[m, "P"], df.loc[m, "CAPE"]
+                if pd.notna(cape_sh) and p_sh:
+                    df.loc[m, "CAPE"] = cape_sh * (p_ours / p_sh)
+                df.loc[m, "P"] = p_ours
+            elif m == sh_last:
+                df.loc[m, "prov"] = True  # Shiller's last price row is a snapshot, not a monthly average
+            if m == cur:
+                df.loc[m, "prov"] = True
+        elif p_ours is not None:
+            prior = df[df.index < m]
+            prev = prior.iloc[-1]
             cpi_est = df["CPI"].iloc[-1]
             denom = prev["P"] / prev["CPI"] / prev["CAPE"]
-            df.loc[cur] = {
+            df.loc[m] = {
                 "P": p_ours, "D": prev["D"], "E": prev["E"], "CPI": cpi_est,
                 "CAPE": (p_ours / cpi_est) / denom, "prov": True,
             }
             df = df.sort_index()
-    elif cur in df.index:
-        df.loc[cur, "prov"] = True  # Shiller's own current-month price is a partial-month value
     df["prov"] = df["prov"].astype(bool)
     return df
 
@@ -295,8 +469,8 @@ def _series_from(eff: pd.DataFrame, series_id: str, today: Optional[date] = None
     else:  # pragma: no cover
         raise FetchError(f"unsupported series_id {series_id}")
     out = pd.DataFrame({"value": v.astype(float), "prov": eff["prov"]})
-    out.index = out.index.to_timestamp(how="end" if month_end else "start").normalize() \
-        if not month_end else out.index.to_timestamp(freq="M", how="end").normalize()
+    out.index = (out.index.to_timestamp(freq="M", how="end") if month_end
+                 else out.index.to_timestamp(how="start")).normalize()
     if month_end:
         # The in-progress month must not carry a future month-end date: date it today
         # (as multpl did for its in-month estimate rows).

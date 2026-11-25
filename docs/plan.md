@@ -82,7 +82,7 @@ Known pre-existing latency (N16, tell Hogan, not changed): monthly series refres
 
 Hard fail (exit 1) if any:
 1. `data_v2.json` missing/invalid.
-2. Series ids ≠ the 41 in `series_v2.yaml` (+ `fwd_pe_history` allowed).
+2. Series ids ≠ the 42 in `series_v2.yaml` (+ `fwd_pe_history` allowed).
 3. `PEC.html` < 1.5 MB, or still contains `__DASHBOARD_DATA__`/`__GENERATED_AT__` outside the comment, or the `<script id="pec-data">` body does not parse to JSON equal to `data_v2.json`.
 4. Source-level failure, over **attempted** series this run: > 3 failed `market_daily` series; or all attempted FRED series failed (≥ 3 attempted); or all attempted Yahoo series failed (≥ 3 attempted). Treasury and multpl failures are governed by staleness only.
 5. Staleness (age of last non-null obs, calendar days) for daily series: `market_daily` 7; FRED FX and `wti_crude` 14 (weekly FRED batches, NB2); `yield_curve` 7. Final values confirmed from spike evidence (Phase 3) before Phase 4. Any one over threshold fails.
@@ -96,7 +96,7 @@ On the zip baseline at 2026-11-20: rule 5 flags `tips_5yr` (17 d) → **fail**. 
 
 ### 6.1 Unit (offline, every push; written by Opus)
 Isolation (N9): autouse fixture monkeypatches `refresh_v2.HERE/CONFIG_PATH/OUTPUT_PATH/BACKUP_DIR`, `spglobal._CACHE_DIR/_HISTORY_JSON/_SEED_YAML/_CACHE_JSON/_CACHE_XLSX` to `tmp_path`; sockets disabled. First Phase 2 task: confirm `import refresh_v2` works under pytest capture (`sys.stdout.reconfigure`, `logging.basicConfig`).
-- Config: loads; 41 unique ids; sources ⊂ registry; required fields.
+- Config: loads; 42 unique ids; sources ⊂ registry; required fields.
 - `_safe_float`, `_dates_to_strings`: NaN, None, inf, 4 dp.
 - `_needs_refresh`, `_last_completed_business_day`, `_market_is_open`: frozen clock via `datetime` subclass monkeypatch (Cut 10); each frequency; open/closed; pre/post close; weekend; month and quarter boundaries; under `TZ=America/Los_Angeles` and `TZ=UTC` (`time.tzset`).
 - `_compute_derived_valuation`: fwd P/E; DDM 4968 (EPS 354.84, 10y 4.00); denom ≤ 0 → None; both delta strings; month join; < 24 months → no fwdpe delta.
@@ -271,3 +271,10 @@ Owner approved ("recommended defaults") replacing the five multpl.com series (do
 - Expected-range checks on Shiller-derived values (fail closed -> FetchError -> carry-forward): PE 8-60, CAPE 5-60, DY 0.5-8%, EY 1.5-15%, nominal EPS 10-600 (real EPS 10-800).
 - Healthcheck is config-driven (series count follows the YAML: 41 -> 42 ids, with `sp500_earnings_nominal`). Warn-only staleness: first-of-month series (pe, earnings yield, cape) warn after 40 days; the 220-day override for earnings is dropped because carried-forward E reaches the current month.
 - `fetchers/multpl.py` stays in the repo, unused.
+
+### QA fixes (docs/qa-shiller.md)
+- M1: every month after the archive cutoff (2026-10) uses our own monthly average of daily ^GSPC closes (one cached Yahoo call per run from the first day of the month after the cutoff); Shiller's P is only a fallback (or when ours is >15% from his). CAPE = Shiller CAPE_m x P_ours / P_shiller_m; a month with no Shiller row is synthesized like the current month (previous month's denominator, latest CPI), provisional. Ended months stay provisional while D/E are carried forward. No month-end jump: values change only when Shiller publishes.
+- M2: a failed workbook load is cached for the process (max one landing + one Yale attempt per run); timeouts connect 10 s / read 30 s; 90 s overall budget for all Shiller network work; the ^GSPC call is cached including failure.
+- M3: `.cache/shiller_health.json` (persisted on the state branch via tools/state.sh) drives a one-time Telegram notice (appended to `eps_change.txt`, name kept for compatibility) after 2 distinct failing PT days since the last success, or when Shiller's latest E is more than 5 months old; re-arms after recovery.
+- Healthcheck rule 2: an id missing from the output with status `error`/absent is a warning ("new series not yet populated"); missing with status `ok` still fails.
+- Licensing: shillerdata.com terms/robots not yet verified - owner to confirm; the workbook is downloaded once per trading day with an identifying User-Agent.

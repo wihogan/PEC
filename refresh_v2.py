@@ -343,6 +343,26 @@ def _append_factset_notice(fetchers: dict) -> None:
         log.warning("Could not append FactSet notice: %s", exc)
 
 
+def _append_shiller_notice(fetchers: dict) -> None:
+    """
+    Append the once-per-condition Shiller health notice (failed on 2 distinct PT days, or the
+    latest published earnings month is over 5 months old) to eps_change.txt, which the
+    workflow's Telegram step sends. The flag file name is kept for backward compatibility
+    (it now carries any informational notice). Never raises.
+    """
+    try:
+        sh_mod = fetchers.get("shiller")
+        if sh_mod is None or not hasattr(sh_mod, "pending_notice"):
+            return
+        text = sh_mod.pending_notice()
+        if text:
+            with open(EPS_CHANGE_FLAG, "a", encoding="utf-8") as fh:
+                fh.write(text.rstrip("\n") + "\n")
+            log.info("Shiller notice queued: %s", text.strip().splitlines()[0])
+    except Exception as exc:  # pragma: no cover
+        log.warning("Could not append Shiller notice: %s", exc)
+
+
 def _fetch_valuation_inputs(
     vi_config: dict,
     fetchers:  dict,
@@ -1071,6 +1091,8 @@ def run(filter_ids: Optional[list] = None, force: bool = False) -> None:
                 "continuing without valuation_inputs block",
                 exc,
             )
+
+    _append_shiller_notice(fetchers)  # after the vi block (which resets eps_change.txt)
 
     # ------------------------------------------------------------------
     # Derived valuation inputs — computed from fetched series + vi_out

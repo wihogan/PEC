@@ -2,7 +2,7 @@
 # Persist data_v2.json (plus the optional EPS cache files) on an orphan branch (plan sections 2-3).
 # Optional files live in .cache/ locally and at the branch root on the state branch:
 # the forward-EPS month-end history (the runner discards config/forward_eps_seed.yaml
-# write-back) and the FactSet once-per-day cache.
+# write-back), the FactSet once-per-day cache and the Shiller failure/notice markers.
 # Usage: tools/state.sh restore <ref> | save <ref>     (ref: state | state-test)
 set -euo pipefail
 
@@ -17,7 +17,7 @@ root="$(git rev-parse --show-toplevel)"
 cd "$root"
 FILE="data_v2.json"
 BASELINE="tests/fixtures/baseline_data_v2.json"
-OPTIONAL_FILES=(forward_eps_ntm_history.json factset_eps_latest.json)
+OPTIONAL_FILES=(forward_eps_ntm_history.json factset_eps_latest.json shiller_health.json)
 
 restore() {
   local out
