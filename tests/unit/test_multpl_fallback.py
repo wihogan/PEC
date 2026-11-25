@@ -215,12 +215,13 @@ def test_multpl_parse_failure_cached_per_series_only(net):
 
 
 def test_multpl_staleness_not_cached_as_down(net):
-    multpl_ok(net)                                      # newest multpl rows: Oct 2026
+    """QA M2: a frozen page is rejected for that series (FetchError) but multpl is not marked down."""
+    multpl_ok(net, {"shiller_pe": [("Nov 24, 2026", "39.80", True)]})     # pe page frozen at Oct 30
     yale_stale(net)
-    with pytest.raises(FetchError, match=r"multpl data stale: last month 2026-10, current 2027-02"):
-        fetch("pe", end="2027-02-10")
-    fetch("cape", end="2027-01-10")                     # 3 months: accepted (multpl still up)
-    assert len(net.multpl_calls()) == 2
+    with pytest.raises(FetchError, match=r"multpl data stale: newest row 2026-10-30, today 2026-11-25 \(max 7 days\)"):
+        fetch("pe")
+    assert fetch("cape").attrs["source_used"] == "multpl"                 # still requested and used
+    assert net.multpl_calls() == [MURL["sp500_pe"], MURL["shiller_pe"]]
 
 
 class Clock:
@@ -279,10 +280,10 @@ def test_multpl_splice_keeps_archive_through_october(net, sid):
 
 @pytest.mark.parametrize(
     "sid, date_, value",
-    [("pe", "2026-11-01", 25.50),                       # Nov 24 row beats Nov 1 row
+    [("pe", "2026-11-01", 25.80),                       # convention-dated Nov 1 row beats the Nov 24 snapshot
      ("earnings_yield", "2026-11-01", 0.0392),
      ("cape", "2026-11-01", 39.80),
-     ("dividend_yield", "2026-11-25", 0.0108)],         # month-end convention, clamped to today
+     ("dividend_yield", "2026-11-25", 0.0108)],         # no Nov 30 row: latest (Nov 24) wins; date clamped to today
 )
 def test_multpl_appended_row(net, sid, date_, value):
     multpl_ok(net, NOV_ROWS)
@@ -312,7 +313,7 @@ def test_multpl_month_end_dates_for_ended_months(net):
         ("2027-02-10", [("Feb 9, 2027", "25.0", False), ("Jan 30, 2027", "25.1", False), ("Dec 31, 2026", "25.2", False),
                         ("Nov 30, 2026", "25.3", True)], "2027-02-01"),
         # no current-month row, no recent dagger -> None
-        ("2027-01-15", [("Dec 31, 2026", "25.1", False), ("Nov 30, 2026", "25.2", False)], None),
+        ("2027-01-05", [("Dec 31, 2026", "25.1", False), ("Nov 30, 2026", "25.2", False)], None),
         # current-month row without dagger is still provisional
         ("2027-01-15", [("Jan 14, 2027", "25.0", False), ("Dec 31, 2026", "25.1", False), ("Nov 30, 2026", "25.2", False)],
          "2027-01-01"),
@@ -323,14 +324,14 @@ def test_multpl_provisional_rule(net, end, rows, expected):
     assert fetch("pe", end=end).attrs["provisional_from"] == expected
 
 
-@pytest.mark.parametrize("end, ok", [("2027-01-31", True), ("2027-02-01", False)])
-def test_multpl_staleness_boundary_3_months(net, end, ok):
-    multpl_ok(net)                                       # newest month Oct 2026
+@pytest.mark.parametrize("end, ok", [("2026-11-06", True), ("2026-11-07", False)])
+def test_multpl_freshness_boundary_7_days_on_saved_page(net, end, ok):
+    multpl_ok(net)                                       # newest shiller_pe row: Oct 30, 2026
     yale_stale(net)
     if ok:
         assert fetch("cape", end=end).attrs["source_used"] == "multpl"
     else:
-        with pytest.raises(FetchError, match="multpl data stale"):
+        with pytest.raises(FetchError, match="multpl data stale: newest row 2026-10-30"):
             fetch("cape", end=end)
 
 
@@ -450,7 +451,9 @@ def test_source_used_in_data_json(monkeypatch, net, freeze, la_tz, tmp_path):
     assert st["sp500_pe"]["source_used"] == "multpl" and st["sp500_pe"]["status"] == "ok"
     # earnings: failed (no multpl, Yale stale) -> carried forward with its previous source_used
     assert out["series"]["sp500_earnings_nominal"] == prior["series"]["sp500_earnings_nominal"]
-    assert st["sp500_earnings_nominal"]["status"] == "error" and "source_used" not in st["sp500_earnings_nominal"]
+    # QA N3: a failed attempt keeps the source_used of the carried data
+    assert st["sp500_earnings_nominal"]["status"] == "error"
+    assert st["sp500_earnings_nominal"]["source_used"] == "shiller"
     # end-of-run notice: fallback message queued in eps_change.txt
     flag = refresh_v2.EPS_CHANGE_FLAG.read_text(encoding="utf-8")
     assert flag == ("ℹ️ PEC valuation series served by multpl.com fallback "
@@ -617,3 +620,210 @@ def test_primary_stale_prices_do_not_fall_over(net):
     with pytest.raises(FetchError, match="price data stale"):
         fetch("pe", end="2027-03-01")                     # workbook prices end 2026-11; E age 6 ok
     assert net.multpl_calls() == []
+
+
+# ===========================================================================
+# QA fixes (docs/qa-multpl-fallback.md): M1 failing-day rule, M2 freshness, row rule, N3
+# ===========================================================================
+def test_m1_earnings_only_retries_on_multpl_never_count(monkeypatch, net):
+    """Day 1: ratio series served by multpl, earnings fail. Days 2-5: only the (errored) earnings
+    series are retried while shillerdata.com stays down -> no failing day, no failing notice."""
+    _, msg = run_once(monkeypatch, net, date(2026, 11, 25), primary=False, multpl_up=True, yale="stale")
+    assert msg == FALLBACK_MULTPL.format(since="2026-11-25")
+    for d in (26, 27, 30):
+        _, msg = run_once(monkeypatch, net, date(2026, 11, d), primary=False, multpl_up=True, yale="stale",
+                          series=EARNINGS)
+        assert msg is None
+    _, msg = run_once(monkeypatch, net, date(2026, 12, 1), primary=False, multpl_up=False, yale="stale",
+                      series=EARNINGS)                     # even with multpl down too: earnings-only
+    assert msg is None
+    h = health()
+    assert h["fail_days"] == 0 and h["last_fail_date"] is None
+    assert h["source"] == "multpl" and h["primary_down_since"] == "2026-11-25"
+
+
+def test_m1_ratio_failure_on_every_source_counts(monkeypatch, net):
+    run_once(monkeypatch, net, date(2026, 11, 25), primary=False, multpl_up=False, yale="stale", series=["cape"])
+    assert health()["fail_days"] == 1
+    run_once(monkeypatch, net, date(2026, 11, 26), primary=False, multpl_up=False, yale="stale",
+             series=EARNINGS + ["pe"])
+    assert health()["fail_days"] == 2
+
+
+def test_m1_frozen_multpl_counts_as_failed_source(monkeypatch, net):
+    """multpl up but frozen (rejected) and Yale stale: ratio series failed everywhere -> failing day."""
+    new_run(monkeypatch)
+    multpl_ok(net)                                        # saved pages: newest rows Oct 2026
+    yale_stale(net)
+    for sid in RATIO:
+        with pytest.raises(FetchError, match="multpl data stale"):
+            fetch(sid)
+    shiller.pending_notice(TODAY)
+    assert health()["fail_days"] == 1
+
+
+# ---------------------------------------------------------------------------
+# M2: freshness on the raw rows (<= 7 days), future month-end rows cannot mask
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("newest, ok", [("Nov 18, 2026", True), ("Nov 17, 2026", False)])
+def test_m2_seven_day_boundary(net, newest, ok):
+    multpl_ok(net, {"sp500_pe": [(newest, "25.60", True)]})
+    yale_stale(net)
+    if ok:
+        assert fetch("pe").attrs["source_used"] == "multpl"
+    else:
+        with pytest.raises(FetchError, match=r"newest row 2026-11-17, today 2026-11-25 \(max 7 days\)"):
+            fetch("pe")
+
+
+@pytest.mark.parametrize("past, ok", [("Nov 18, 2026", True), ("Nov 17, 2026", False)])
+def test_m2_future_month_end_row_does_not_mask_frozen_page(net, past, ok):
+    """A month-end row dated in the future (Nov 30 on Nov 25) is ignored by the freshness check."""
+    multpl_ok(net, {"sp500_div_yield": [("Nov 30, 2026", "1.09%", True), (past, "1.07%", True)]})
+    yale_stale(net)
+    if ok:
+        df = fetch("dividend_yield")
+        # the Nov 30 month-end row is the convention row: it wins, dated today
+        assert df["date"].iloc[-1] == pd.Timestamp("2026-11-25") and df["value"].iloc[-1] == pytest.approx(0.0109)
+    else:
+        with pytest.raises(FetchError, match="newest row 2026-11-17"):
+            fetch("dividend_yield")
+
+
+def test_m2_only_future_rows_is_stale(net):
+    """A page whose only rows after the archive are future-dated (and older rows are old) is rejected."""
+    multpl_ok(net, {"sp500_div_yield": [("Nov 30, 2026", "1.09%", True)]})   # next past row: Oct 31
+    yale_stale(net)
+    with pytest.raises(FetchError, match="newest row 2026-10-31"):
+        fetch("dividend_yield")
+
+
+def test_m2_rejection_falls_through_to_yale(net):
+    multpl_ok(net)                                       # frozen pages
+    yale_fresh(net)
+    for sid in RATIO:
+        assert fetch(sid).attrs["source_used"] == "yale"
+    assert net.calls.count(shiller._YALE_URL) == 1 and len(net.multpl_calls()) == 4
+
+
+def test_m2_rejection_carries_november_point_forward(monkeypatch, net, freeze, la_tz, tmp_path):
+    """shillerdata.com down, multpl frozen, Yale stale: refresh_v2 keeps the existing series
+    (including its November point) and the status keeps source_used."""
+    multpl_ok(net)
+    yale_stale(net)
+    freeze(datetime(2026, 11, 25, 13, 20, tzinfo=PT))
+    freeze(datetime(2026, 11, 25, 13, 20, tzinfo=PT), module=shiller)
+    cfg = {"series": [{"id": "sp500_pe", "source": "shiller", "series_id": "pe", "label": "PE",
+                       "start_date": "2010-01-01", "refresh_frequency": "daily_after_close"}]}
+    p = tmp_path / "series.yaml"
+    p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    monkeypatch.setattr(refresh_v2, "CONFIG_PATH", p)
+    prior_series = {"dates": ["2026-10-01", "2026-10-30", "2026-11-01"], "values": [26.29, 25.86, 25.8],
+                    "provisional_from": "2026-11-01", "source_used": "multpl"}
+    prior = {"metadata": {"statuses": {"sp500_pe": {"status": "ok", "source_used": "multpl",
+                                                    "last_fetched": "2026-11-24T13:20:00"}}},
+             "series": {"sp500_pe": prior_series}}
+    refresh_v2.OUTPUT_PATH.write_text(json.dumps(prior), encoding="utf-8")
+    monkeypatch.setattr(refresh_v2, "_load_fetchers", lambda: {"shiller": shiller})
+    refresh_v2.run(force=True)
+    out = json.loads(refresh_v2.OUTPUT_PATH.read_text(encoding="utf-8"))
+    assert out["series"]["sp500_pe"] == prior_series                     # November point not dropped
+    st = out["metadata"]["statuses"]["sp500_pe"]
+    assert st["status"] == "error" and "multpl data stale" in st["error"]
+    assert st["source_used"] == "multpl" and st["last_fetched"] == "2026-11-24T13:20:00"
+    assert health()["fail_days"] == 1                                    # ratio series failed everywhere
+
+
+# ---------------------------------------------------------------------------
+# Row rule per series: convention-dated row > latest-dated row of the month
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "sid, mp, rows, value",
+    [
+        # first-of-month convention (pe / ey / cape): the Nov 1 month row beats later snapshots
+        ("pe", "sp500_pe", [("Nov 24, 2026", "25.50", True), ("Nov 1, 2026", "25.80", False)], 25.80),
+        ("earnings_yield", "sp500_earnings_yield", [("Nov 24, 2026", "3.92%", True), ("Nov 1, 2026", "3.88%", True)], 0.0388),
+        ("cape", "shiller_pe", [("Nov 24, 2026", "39.80", True), ("Nov 1, 2026", "39.60", False)], 39.60),
+        # no convention row: the latest-dated row of the month is the fallback
+        ("pe", "sp500_pe", [("Nov 24, 2026", "25.50", True), ("Nov 20, 2026", "25.70", True)], 25.50),
+        ("cape", "shiller_pe", [("Nov 24, 2026", "39.80", True)], 39.80),
+        # month-end convention (dividend yield): the Nov 30 row beats the Nov 24 snapshot
+        ("dividend_yield", "sp500_div_yield", [("Nov 30, 2026", "1.09%", True), ("Nov 24, 2026", "1.07%", True)], 0.0109),
+        ("dividend_yield", "sp500_div_yield", [("Nov 24, 2026", "1.07%", True), ("Nov 3, 2026", "1.20%", True)], 0.0107),
+        # a first-of-month row is NOT the dividend-yield convention
+        ("dividend_yield", "sp500_div_yield", [("Nov 24, 2026", "1.07%", True), ("Nov 1, 2026", "1.20%", True)], 0.0107),
+    ],
+)
+def test_row_rule(net, sid, mp, rows, value):
+    multpl_ok(net, {mp: rows})
+    df = fetch(sid)
+    assert df["value"].iloc[-1] == pytest.approx(value)
+    months = df["date"].dt.to_period("M")
+    assert (months == pd.Period("2026-11", "M")).sum() == 1
+
+
+def test_row_rule_ended_months(net):
+    """Ended months: the convention row wins there too (Dec page: Nov 1 month row vs Nov 30 snapshot)."""
+    multpl_ok(net, {"sp500_pe": [("Dec 9, 2026", "25.9", True), ("Dec 1, 2026", "25.7", False),
+                                 ("Nov 30, 2026", "25.1", False), ("Nov 1, 2026", "25.4", False)]})
+    df = fetch("pe", end="2026-12-10")
+    assert df["date"].dt.strftime("%Y-%m-%d").tolist()[-2:] == ["2026-11-01", "2026-12-01"]
+    assert df["value"].tolist()[-2:] == pytest.approx([25.4, 25.7])
+
+
+# ---------------------------------------------------------------------------
+# Shiller -> multpl -> Shiller flip on the same month, through refresh_v2
+# ---------------------------------------------------------------------------
+def _flip_run(monkeypatch, net, freeze, cfg_path, day, primary):
+    new_run(monkeypatch)
+    net.routes.clear()
+    if primary:
+        primary_ok(net)
+    multpl_ok(net, {"sp500_pe": [("Nov 24, 2026", "25.50", True), ("Nov 1, 2026", "25.80", False)],
+                    "sp500_div_yield": [("Nov 30, 2026", "1.09%", True), ("Nov 24, 2026", "1.07%", True)]})
+    yale_stale(net)
+    when = datetime(day.year, day.month, day.day, 13, 20, tzinfo=PT)
+    freeze(when)
+    freeze(when, module=shiller)
+    refresh_v2.EPS_CHANGE_FLAG.unlink(missing_ok=True)
+    refresh_v2.run(force=True)
+    out = json.loads(refresh_v2.OUTPUT_PATH.read_text(encoding="utf-8"))
+    flag = refresh_v2.EPS_CHANGE_FLAG.read_text(encoding="utf-8") if refresh_v2.EPS_CHANGE_FLAG.exists() else None
+    return out, flag
+
+
+def test_flip_shiller_multpl_shiller_same_month(monkeypatch, net, freeze, la_tz, tmp_path):
+    cfg = {"series": [
+        {"id": "sp500_pe", "source": "shiller", "series_id": "pe", "label": "PE",
+         "start_date": "2010-01-01", "refresh_frequency": "daily_after_close"},
+        {"id": "sp500_dividend_yield", "source": "shiller", "series_id": "dividend_yield", "label": "DY",
+         "start_date": "2010-01-01", "refresh_frequency": "daily_after_close"},
+    ]}
+    p = tmp_path / "series.yaml"
+    p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+    monkeypatch.setattr(refresh_v2, "CONFIG_PATH", p)
+    monkeypatch.setattr(refresh_v2, "_load_fetchers", lambda: {"shiller": shiller})
+
+    runs = [(date(2026, 11, 24), True), (date(2026, 11, 25), False), (date(2026, 11, 26), True)]
+    outs, flags = [], []
+    for day, primary in runs:
+        out, flag = _flip_run(monkeypatch, net, freeze, p, day, primary)
+        outs.append(out)
+        flags.append(flag)
+
+    srcs = [(o["series"]["sp500_pe"]["source_used"], o["metadata"]["statuses"]["sp500_pe"]["source_used"]) for o in outs]
+    assert srcs == [("shiller", "shiller"), ("multpl", "multpl"), ("shiller", "shiller")]
+    for o in outs:
+        for sid in ("sp500_pe", "sp500_dividend_yield"):
+            d = o["series"][sid]["dates"]
+            assert len(d) == len(set(d)) and d == sorted(d), sid
+            assert sum(x.startswith("2026-11") for x in d) == 1, sid             # one November point
+    pe_last = [(o["series"]["sp500_pe"]["dates"][-1], o["series"]["sp500_pe"]["values"][-1]) for o in outs]
+    shiller_pe = round(7619.38 / 295.5184, 4)                                      # no ^GSPC: Shiller P
+    assert pe_last == [("2026-11-01", shiller_pe), ("2026-11-01", 25.8), ("2026-11-01", shiller_pe)]
+    dy_dates = [o["series"]["sp500_dividend_yield"]["dates"][-1] for o in outs]
+    assert dy_dates == ["2026-11-24", "2026-11-25", "2026-11-26"]                  # each run's today
+    # archive history identical in all three runs
+    n = len(outs[0]["series"]["sp500_pe"]["dates"]) - 1
+    assert all(o["series"]["sp500_pe"]["dates"][:n] == outs[0]["series"]["sp500_pe"]["dates"][:n] for o in outs)
+    assert flags == [None, FALLBACK_MULTPL.format(since="2026-11-25"), BACK]

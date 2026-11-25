@@ -907,7 +907,7 @@ def _good_run(monkeypatch, net, day=TODAY):
 
 FAILING_TEXT = ("\u2139\ufe0f PEC: Valuation data fetch (shillerdata.com, multpl.com and Yale) has failed "
                 "on {n} different days. P/E, CAPE and earnings series are carried forward; "
-                "see docs/plan.md Amendment C.\n")
+                "see docs/plan.md Amendment D.\n")
 
 
 def test_m3_no_health_file_no_notice():
