@@ -1,0 +1,8 @@
+{
+  "fail_days": 0,
+  "last_fail_date": null,
+  "last_e": "2026-09",
+  "source": "shiller",
+  "primary_down_since": null,
+  "notified": {}
+}
